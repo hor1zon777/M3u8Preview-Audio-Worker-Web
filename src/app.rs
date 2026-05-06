@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
@@ -10,6 +11,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config;
 use crate::handler;
+use crate::handler::auth::auth_middleware;
 use crate::state::{AppState, SharedState};
 
 /// 构建 Axum Router + AppState。
@@ -43,13 +45,16 @@ pub fn build(config_path: PathBuf, port: u16) -> (Router, SharedState) {
     let fallback = if static_dir.join("index.html").exists() {
         ServeFile::new(static_dir.join("index.html"))
     } else {
-        // 开发模式：如果 static 目录不存在，返回 404 提示
         tracing::warn!("static dir not found at {:?}, frontend will not be available", static_dir);
-        ServeFile::new(PathBuf::from("/dev/null")) // placeholder
+        ServeFile::new(PathBuf::from("/dev/null"))
     };
 
-    let app = Router::new()
-        // API 路由
+    // 公开路由（不需要鉴权）
+    let public_routes = Router::new()
+        .route("/api/auth/check", get(handler::auth::auth_check));
+
+    // 受保护路由（需要鉴权中间件）
+    let protected_routes = Router::new()
         .route("/api/settings", get(handler::settings::get).put(handler::settings::save))
         .route("/api/validate-dir", post(handler::settings::validate_dir))
         .route("/api/status", get(handler::status::runtime_status))
@@ -62,8 +67,13 @@ pub fn build(config_path: PathBuf, port: u16) -> (Router, SharedState) {
         .route("/api/ws/logs", get(handler::logs::ws_stream))
         .route("/api/doctor", get(handler::doctor::probe))
         .route("/api/history", get(handler::history::list).delete(handler::history::clear))
-        .route("/api/history/{jobId}", get(handler::history::get_detail))
-        // 静态前端
+        .route("/api/history/{jobId}", get(handler::history::get_detail));
+
+    let app = Router::new()
+        .merge(public_routes)
+        .merge(protected_routes)
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        // 静态前端（不受鉴权中间件保护）
         .fallback_service(ServeDir::new(static_dir).fallback(fallback))
         .layer(cors)
         .with_state(state.clone());

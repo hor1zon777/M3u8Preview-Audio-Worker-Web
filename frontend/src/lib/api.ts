@@ -1,6 +1,7 @@
 // api.ts：HTTP API 客户端（替代 Tauri IPC invoke）。
 //
-// 每个函数一一对应原 tauri.ts 的 invoke 包装，签名保持一致，页面组件无需改动。
+// 支持 Bearer token 鉴权：token 存储在 localStorage，
+// 所有请求自动注入 Authorization 头，WebSocket 通过 query param 传递。
 
 import type {
   Settings,
@@ -15,13 +16,40 @@ import type {
 } from './types';
 
 const BASE = import.meta.env.VITE_API_BASE ?? '';
+const TOKEN_KEY = 'audio_worker_auth_token';
 
-/** 通用 API 封装：解析 {success, data, message} 信封 */
+// ---- Token 管理 ----
+
+export function getToken(): string {
+  return localStorage.getItem(TOKEN_KEY) ?? '';
+}
+
+export function setToken(token: string): void {
+  if (token) {
+    localStorage.setItem(TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(TOKEN_KEY);
+  }
+}
+
+// ---- 通用 API 封装 ----
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  const token = getToken();
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const resp = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...init,
   });
+  if (resp.status === 401) {
+    throw new Error('UNAUTHORIZED');
+  }
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
     throw new Error(`${resp.status}: ${text}`);
@@ -31,6 +59,31 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(envelope.message ?? 'unknown error');
   }
   return envelope.data as T;
+}
+
+// ---- 鉴权 ----
+
+export interface AuthCheckResult {
+  required: boolean;
+  has_token: boolean;
+}
+
+export async function authCheck(): Promise<AuthCheckResult> {
+  const resp = await fetch(`${BASE}/api/auth/check`);
+  const envelope = await resp.json();
+  return envelope.data as AuthCheckResult;
+}
+
+/** 尝试用当前 token 访问 /api/status 验证是否有效 */
+export async function validateToken(): Promise<boolean> {
+  try {
+    await api<RuntimeStatus>('/api/status');
+    return true;
+  } catch (e) {
+    if (e instanceof Error && e.message === 'UNAUTHORIZED') return false;
+    // 网络错误等不视为 token 无效
+    return true;
+  }
 }
 
 // ---- Settings ----
@@ -156,7 +209,9 @@ export async function retrySubtitleJob(mediaId: string): Promise<void> {
 
 export function connectLogStream(onMessage: (entry: LogEntry) => void): WebSocket {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/api/ws/logs`);
+  const token = getToken();
+  const tokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
+  const ws = new WebSocket(`${proto}//${location.host}/api/ws/logs${tokenParam}`);
   ws.onmessage = (e) => {
     try {
       onMessage(JSON.parse(e.data));
@@ -175,6 +230,5 @@ export function onWorkerEvent<T = unknown>(
   _name: string,
   _cb: (payload: T) => void,
 ): Promise<UnlistenFn> {
-  // Web 版通过轮询 getRuntimeStatus 获取状态变化，不需要事件订阅
   return Promise.resolve(() => {});
 }

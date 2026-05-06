@@ -58,6 +58,8 @@ export interface Settings {
   ui: UiSettings;
   worker_id: string;
   worker_name: string;
+  /** Web 管理面板鉴权 token。空 = 不需要鉴权。 */
+  web_auth_token: string;
 }
 
 export interface CurrentTask {

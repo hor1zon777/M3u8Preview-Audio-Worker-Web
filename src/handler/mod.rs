@@ -1,5 +1,6 @@
 // handler/mod.rs：HTTP handler 模块。
 
+pub mod auth;
 pub mod control;
 pub mod doctor;
 pub mod history;

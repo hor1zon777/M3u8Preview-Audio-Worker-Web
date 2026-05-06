@@ -28,5 +28,6 @@
     "autostart": false
   },
   "worker_id": "",
-  "worker_name": "audio-worker-docker"
+  "worker_name": "audio-worker-docker",
+  "web_auth_token": ""
 }

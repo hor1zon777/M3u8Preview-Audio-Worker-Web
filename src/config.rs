@@ -23,6 +23,13 @@ pub struct Settings {
     /// 用户给这台 worker 起的名字（默认主机名）
     #[serde(default)]
     pub worker_name: String,
+
+    /// Web 管理面板鉴权 token。空 = 不需要鉴权。
+    ///
+    /// 设置后所有 /api/* 请求需要 `Authorization: Bearer <token>` 头。
+    /// WebSocket 连接通过 `?token=<token>` 查询参数传递。
+    #[serde(default)]
+    pub web_auth_token: String,
 }
 
 impl Default for Settings {
@@ -34,6 +41,7 @@ impl Default for Settings {
             ui: UiSettings::default(),
             worker_id: String::new(),
             worker_name: detect_default_worker_name(),
+            web_auth_token: String::new(),
         }
     }
 }

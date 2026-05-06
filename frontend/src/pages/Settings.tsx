@@ -561,6 +561,25 @@ export function Settings() {
         </Field>
       </section>
 
+      {/* Web 面板鉴权 */}
+      <section className="space-y-3">
+        <h2 className="text-base font-semibold text-white">Web 面板鉴权</h2>
+        <Field label="Access Token（留空 = 不需要鉴权）">
+          <input
+            type="password"
+            className="input"
+            placeholder="留空则任何人可访问管理面板"
+            value={form.web_auth_token ?? ''}
+            onChange={(e) =>
+              setForm({ ...form, web_auth_token: e.target.value })
+            }
+          />
+          <div className="mt-1 text-[11px] text-emby-text-muted leading-snug">
+            设置后浏览器访问面板需要输入此 Token。修改后需刷新页面重新登录。
+          </div>
+        </Field>
+      </section>
+
       {/* UI */}
       <section className="space-y-3">
         <h2 className="text-base font-semibold text-white">界面</h2>
