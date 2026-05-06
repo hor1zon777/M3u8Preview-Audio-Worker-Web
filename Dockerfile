@@ -7,7 +7,7 @@ COPY frontend/ .
 RUN pnpm build
 
 # ---- 阶段 2：构建 Rust 后端 ----
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.87-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
