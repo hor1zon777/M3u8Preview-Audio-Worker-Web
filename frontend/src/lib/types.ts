@@ -123,6 +123,12 @@ export interface RegisterResponse {
 }
 
 export interface LogEntry {
+  /**
+   * 全局单调递增序号（后端 AtomicU64 分配）。
+   * 前端按此字段排序，避免毫秒精度 ts 对同毫秒多条日志排序不稳定 / React key 跳动。
+   * 兼容老服务端：缺省时回退到 0，前端会用 ts 兜底排序。
+   */
+  seq?: number;
   ts: number;
   level: string;
   target: string;

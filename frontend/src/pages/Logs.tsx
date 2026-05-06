@@ -52,16 +52,27 @@ export function Logs() {
     }
   }, [logs, autoScroll]);
 
-  const visible = logs.filter((e) => {
-    if (e.ts < clearTs) return false;
-    if (!filter) return true;
-    const lf = filter.toLowerCase();
-    return (
-      e.message.toLowerCase().includes(lf) ||
-      e.target.toLowerCase().includes(lf) ||
-      e.level.toLowerCase().includes(lf)
-    );
-  });
+  const visible = logs
+    .filter((e) => {
+      if (e.ts < clearTs) return false;
+      if (!filter) return true;
+      const lf = filter.toLowerCase();
+      return (
+        e.message.toLowerCase().includes(lf) ||
+        e.target.toLowerCase().includes(lf) ||
+        e.level.toLowerCase().includes(lf)
+      );
+    })
+    // v4：按 seq 升序，避免毫秒精度 ts 对同一毫秒内多条日志的相对顺序不稳定。
+    // 老服务端没有 seq → 回退按 ts 排（同 ts 时保持原数组顺序，因为 Array#sort 在
+    // V8 中是 stable 的）。
+    .slice()
+    .sort((a, b) => {
+      const sa = a.seq ?? 0;
+      const sb = b.seq ?? 0;
+      if (sa !== sb) return sa - sb;
+      return a.ts - b.ts;
+    });
 
   const handleCopyAll = async () => {
     if (visible.length === 0) return;
@@ -133,7 +144,11 @@ export function Logs() {
         {visible.length === 0 ? (
           <div className="text-center text-emby-text-muted py-12">暂无日志</div>
         ) : (
-          visible.map((entry, idx) => <LogRow key={`${entry.ts}-${idx}`} entry={entry} />)
+          // v4：React key 用 seq（全局单调递增），避免 ts 重复时复用错位行。
+          // 老服务端无 seq → 回退到 ts-idx 复合 key 兜底。
+          visible.map((entry, idx) => (
+            <LogRow key={entry.seq ?? `${entry.ts}-${idx}`} entry={entry} />
+          ))
         )}
       </div>
 

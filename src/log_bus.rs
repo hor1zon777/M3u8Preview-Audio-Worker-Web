@@ -4,8 +4,18 @@
 //   - 保留环形缓冲（Mutex<VecDeque>，最大 2000 条）
 //   - 新增 tokio::sync::broadcast channel（容量 512）用于 WebSocket 实时推送
 //   - tracing Layer 实现：同时写入 ring buffer + broadcast
+//
+// v4 顺序保证：
+//   每条日志带一个全局单调递增 `seq: u64`（AtomicU64::fetch_add）。
+//   背景：subprocess 的 stdout / stderr 在两个并发 tokio task 中各自 tracing，
+//   `ts` 毫秒精度对同一毫秒内的多条日志无法区分先后；前端 React Query 整体替换
+//   日志数组时同毫秒的相对顺序受 ECMAScript Array sort stability 与 key 选择
+//   影响，会出现"闪烁 / 跳序"。
+//   引入 seq 后：后端 push 即 fetch_add，全局严格有序；前端按 seq 排序 + 用 seq
+//   做 React key，行身份稳定。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -18,6 +28,9 @@ const BROADCAST_CAPACITY: usize = 512;
 /// 单条日志记录。
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
+    /// 全局单调递增序号（AtomicU64 分配）。
+    /// 前端按此字段排序，避免毫秒精度 ts 对同毫秒多条日志排序不稳定。
+    pub seq: u64,
     pub ts: i64,
     pub level: String,
     pub target: String,
@@ -28,6 +41,7 @@ pub struct LogEntry {
 pub struct LogBus {
     ring: Mutex<VecDeque<LogEntry>>,
     tx: broadcast::Sender<LogEntry>,
+    next_seq: AtomicU64,
 }
 
 impl LogBus {
@@ -36,11 +50,21 @@ impl LogBus {
         Self {
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             tx,
+            next_seq: AtomicU64::new(1),
         }
     }
 
     /// 推送一条日志到 ring buffer + broadcast。
-    fn push(&self, entry: LogEntry) {
+    /// seq 在这里分配（AtomicU64 单调递增），保证全局严格有序。
+    fn push(&self, ts: i64, level: String, target: String, message: String) {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let entry = LogEntry {
+            seq,
+            ts,
+            level,
+            target,
+            message,
+        };
         {
             let mut ring = self.ring.lock().unwrap();
             if ring.len() >= RING_CAPACITY {
@@ -53,6 +77,7 @@ impl LogBus {
     }
 
     /// 获取最近 N 条日志快照。
+    /// 按 ring 内的入队顺序（即 seq 升序）返回。
     pub fn snapshot(&self, limit: usize) -> Vec<LogEntry> {
         let ring = self.ring.lock().unwrap();
         let skip = ring.len().saturating_sub(limit);
@@ -82,16 +107,14 @@ where
         let mut visitor = MessageVisitor(String::new());
         event.record(&mut visitor);
 
-        let entry = LogEntry {
-            ts: chrono::Utc::now().timestamp_millis(),
-            level: metadata.level().to_string(),
-            target: metadata.target().to_string(),
-            message: visitor.0,
-        };
-
         // 安全：LOG_BUS 在 main 中初始化，始终可用
         if let Some(bus) = LOG_BUS.get() {
-            bus.push(entry);
+            bus.push(
+                chrono::Utc::now().timestamp_millis(),
+                metadata.level().to_string(),
+                metadata.target().to_string(),
+                visitor.0,
+            );
         }
     }
 }
