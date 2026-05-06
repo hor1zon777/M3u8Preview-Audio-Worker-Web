@@ -10,6 +10,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use tokio::task::AbortHandle;
+
 use crate::config::Settings;
 
 /// 当前正在处理的任务（runtime 运行时状态，不持久化）。
@@ -49,6 +51,13 @@ pub struct AppState {
     pub server_max_concurrent_tasks: AtomicU32,
     pub polling_paused: AtomicBool,
     pub started_at: Instant,
+
+    /// v4：每个正在跑的 job 对应的 AbortHandle。
+    /// poller spawn 时通过 register_running_handle 存入；handle_job 完成时
+    /// take_running_handle 取出并丢弃。
+    /// handler::control::cancel_task 通过 abort_running 触发 abort，让 pipeline
+    /// 在下一个 await 点立即中止。
+    running_handles: Mutex<HashMap<String, AbortHandle>>,
 }
 
 impl AppState {
@@ -66,6 +75,7 @@ impl AppState {
             server_max_concurrent_tasks: AtomicU32::new(0),
             polling_paused: AtomicBool::new(false),
             started_at: Instant::now(),
+            running_handles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -127,6 +137,30 @@ impl AppState {
 
     pub fn snapshot_tasks(&self) -> Vec<CurrentTask> {
         self.current_tasks.lock().unwrap().values().cloned().collect()
+    }
+
+    // === v4：任务取消支持 ===
+
+    /// 把一个 spawned pipeline task 的 AbortHandle 注册进来，让 HTTP handler
+    /// 可以通过 abort_running 触发 abort。
+    pub fn register_running_handle(&self, job_id: String, handle: AbortHandle) {
+        self.running_handles.lock().unwrap().insert(job_id, handle);
+    }
+
+    /// 从 map 取出（不 abort）。handle_job 正常结束时调用，避免 leak。
+    pub fn take_running_handle(&self, job_id: &str) -> Option<AbortHandle> {
+        self.running_handles.lock().unwrap().remove(job_id)
+    }
+
+    /// 取出并 abort：让 pipeline 在下一个 await 点立即中止。
+    /// 不存在则 false（任务可能已完成或刚被取消）。
+    pub fn abort_running(&self, job_id: &str) -> bool {
+        if let Some(h) = self.running_handles.lock().unwrap().remove(job_id) {
+            h.abort();
+            true
+        } else {
+            false
+        }
     }
 }
 

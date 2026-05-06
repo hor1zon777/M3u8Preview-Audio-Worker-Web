@@ -215,3 +215,20 @@ export interface BootstrapProgress {
   finished: boolean;
   error: string;
 }
+
+/**
+ * v4：本地 FLAC artifact（已 audio_ready，等待 subtitle worker 拉取）。
+ *
+ * 列表来源：audio_storage_dir 下的 .flac + .json 索引对。
+ * 用户可通过 UI 主动删除（默认 notify=true 让服务端 audio-lost 把任务回 queued）。
+ */
+export interface LocalArtifact {
+  job_id: string;
+  media_id: string;
+  size: number;
+  sha256: string;
+  format: string;
+  duration_ms: number;
+  flac_path: string;
+  created_at_ms: number;
+}

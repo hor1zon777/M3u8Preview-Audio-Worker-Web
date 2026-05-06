@@ -16,6 +16,7 @@
 // 错误归因：每个阶段失败都加阶段前缀，方便从服务器侧 errorMsg 一眼看出哪一步挂了。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -97,7 +98,15 @@ pub async fn run_pipeline(
         stage: "queued".to_string(),
         progress: 1,
     }));
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    // v4：心跳取消信号必须用持久化标志（AtomicBool）。
+    //
+    // 历史 bug：v3 用 tokio::sync::Notify + notify_waiters()，但 notify_waiters() 是
+    // 一次性事件，对"还没进入 .notified() await"的任务无效。心跳任务在两次 sleep 之间
+    // 短暂离开 select! 的 cancel arm，notify_waiters 这时被调用就完全丢失，导致心跳
+    // 在 audio_ready 之后还会继续 fire 30s（用户日志中两次 410 间隔正是 30s 心跳周期）。
+    //
+    // AtomicBool 是持久化的：只要 set true，下一次 sleep 醒来检查就一定会看到。
+    let cancel = Arc::new(AtomicBool::new(false));
 
     // 启动 heartbeat task
     let hb_settings = state.settings.read().unwrap().clone();
@@ -111,7 +120,8 @@ pub async fn run_pipeline(
         *state.stale_threshold_sec.read().unwrap(),
     );
 
-    // 跑流水线
+    // 跑流水线（pipeline_inner 会在 audio_ready 成功后立即 cancel 心跳，
+    // 避免服务端清空 claimed_by 后心跳收到 410）
     let mut ctx = PipelineCtx::default();
     let result = pipeline_inner(
         &state,
@@ -119,6 +129,7 @@ pub async fn run_pipeline(
         &job,
         &m3u8_url,
         &phase,
+        Arc::clone(&cancel),
         &mut ctx,
     )
     .await;
@@ -127,8 +138,8 @@ pub async fn run_pipeline(
         tracing::warn!("[runner] job {} aborted: {e:#}", job.job_id);
     }
 
-    // 通知 heartbeat 退出
-    cancel.notify_waiters();
+    // 兜底 cancel + join heartbeat（pipeline_inner 提前成功 cancel 时是 no-op）
+    cancel.store(true, Ordering::Release);
     let _ = heartbeat.await;
 
     // 落库：终态
@@ -180,6 +191,7 @@ async fn pipeline_inner(
     job: &ClaimedJob,
     m3u8_url: &str,
     phase: &Arc<RwLock<Phase>>,
+    cancel: Arc<AtomicBool>,
     ctx: &mut PipelineCtx,
 ) -> Result<(u64, String, i64)> {
     // 0. 准备工具 + 临时工作目录
@@ -366,6 +378,12 @@ async fn pipeline_inner(
         // 注册失败：保留本地 FLAC + 索引，等下次 audio worker 启动时 startup_resync
         return Err(anyhow!("audio_ready: {e}"));
     }
+
+    // v4：audio_ready 成功 → 服务端清空 claimed_by → 心跳如果继续 fire 会拿 410。
+    // 立刻 cancel 心跳任务避免噪音 + 误导日志。
+    // 后续 set_phase / push_stage 仅本地状态，不走网络。
+    cancel.store(true, Ordering::Release);
+
     set_phase(phase, "encoding_intermediate", 99);
     update_state_task(state, &job.job_id, "encoding_intermediate", 99);
     push_stage(ctx, &job.job_id, "encode_and_register", stage_start);
@@ -458,13 +476,23 @@ fn create_workdir(temp_base: &str) -> Result<TempDir> {
     }
 }
 
-/// 心跳后台 task：周期上报当前 stage + progress；fail/done 时由 main task notify_waiters 退出。
+/// 心跳后台 task：周期上报当前 stage + progress；fail/done 时由 main task 通过
+/// `cancel.store(true)` 通知退出。
+///
+/// v4：cancel 用 `Arc<AtomicBool>` 而不是 `tokio::sync::Notify`。
+/// 原因：Notify::notify_waiters() 不留存许可，对"未在 .notified() await 的 waiter"
+/// 完全无效。心跳任务在两次 sleep 之间短暂离开 select! 的 cancel arm 时调用
+/// notify_waiters 会丢信号。AtomicBool 是持久化标志，下次 sleep 醒来读到 true
+/// 一定退出。
+///
+/// 单次心跳调用走 `tokio::time::timeout` 包一层，避免请求被 30s+ 慢响应卡住，
+/// 进而错过取消窗口。
 fn spawn_heartbeat(
     client: Arc<ApiClient>,
     worker_id: String,
     job_id: String,
     phase: Arc<RwLock<Phase>>,
-    cancel: Arc<tokio::sync::Notify>,
+    cancel: Arc<AtomicBool>,
     interval_sec: u64,
     stale_threshold_sec: u64,
 ) -> JoinHandle<()> {
@@ -481,17 +509,42 @@ fn spawn_heartbeat(
     }
     tokio::spawn(async move {
         let dur = Duration::from_secs(actual);
+        // 心跳轮询：用粗粒度 sleep + 细粒度 cancel 检查双保险。
+        // 把 dur 拆成 ≤500ms 的 tick，sleep 期间也能快速响应 cancel。
+        let tick = Duration::from_millis(500);
         loop {
-            tokio::select! {
-                _ = cancel.notified() => return,
-                _ = tokio::time::sleep(dur) => {
-                    let snap = phase.read().unwrap().clone();
-                    if let Err(e) = client
-                        .heartbeat(&job_id, &worker_id, &snap.stage, snap.progress)
-                        .await
-                    {
-                        tracing::warn!("[runner] heartbeat failed: {e}");
+            // 等一个心跳周期，期间每 500ms 检查一次 cancel
+            let mut waited = Duration::ZERO;
+            while waited < dur {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let step = tick.min(dur - waited);
+                tokio::time::sleep(step).await;
+                waited += step;
+            }
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let snap = phase.read().unwrap().clone();
+            // 单次心跳给 10s 上限，避免被慢服务端卡到下一个心跳周期
+            let send = client.heartbeat(&job_id, &worker_id, &snap.stage, snap.progress);
+            match tokio::time::timeout(Duration::from_secs(10), send).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // 410 / job lost 时不再继续刷心跳——服务端已认定 ownership 失效
+                    if matches!(e, crate::api::ApiError::JobLost) {
+                        tracing::debug!(
+                            "[runner] heartbeat got 410 (claimed_by cleared / job lost), \
+                             stop heartbeating job={}",
+                            job_id
+                        );
+                        return;
                     }
+                    tracing::warn!("[runner] heartbeat failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("[runner] heartbeat timed out (>10s), will retry next tick");
                 }
             }
         }

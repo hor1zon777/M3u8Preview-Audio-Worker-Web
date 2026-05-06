@@ -149,9 +149,13 @@ pub async fn run(state: SharedState) {
 
                 let state_clone = state.clone();
                 let client_clone = client_arc.clone();
-                tokio::spawn(async move {
+                let job_id_for_handle = job.job_id.clone();
+                let join_handle = tokio::spawn(async move {
                     handle_job(&state_clone, client_clone, job).await;
                 });
+                // v4：把 spawned task 的 abort handle 注册到 state，
+                // 让 HTTP handler 可以通过 POST /api/tasks/:job_id/cancel 中止此任务。
+                state.register_running_handle(job_id_for_handle, join_handle.abort_handle());
                 continue;
             }
             Ok(None) => {
@@ -309,6 +313,8 @@ async fn handle_job(state: &SharedState, client: Arc<ApiClient>, job: ClaimedJob
 
     // 从任务表移除
     state.remove_task(&job.job_id);
+    // 清理 abort handle 注册（task 已结束，不再可取消）
+    let _ = state.take_running_handle(&job.job_id);
 }
 
 /// 指数退避：每次 error 翻倍，封顶 60s。

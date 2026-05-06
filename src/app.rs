@@ -63,6 +63,11 @@ pub fn build(config_path: PathBuf, port: u16) -> (Router, SharedState) {
         .route("/api/retry/{mediaId}", post(handler::status::retry_job))
         .route("/api/pause", post(handler::control::pause_polling))
         .route("/api/resume", post(handler::control::resume_polling))
+        // v4：主动取消正在跑的任务（abort + 服务端 worker_capacity 回 queued）
+        .route("/api/tasks/{jobId}/cancel", post(handler::control::cancel_task))
+        // v4：本地 FLAC artifact 列表 + 单条删除
+        .route("/api/artifacts", get(handler::artifacts::list))
+        .route("/api/artifacts/{jobId}", delete(handler::artifacts::delete))
         .route("/api/logs", get(handler::logs::get_recent))
         .route("/api/ws/logs", get(handler::logs::ws_stream))
         .route("/api/doctor", get(handler::doctor::probe))

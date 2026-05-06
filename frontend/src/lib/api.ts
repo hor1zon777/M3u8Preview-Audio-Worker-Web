@@ -13,6 +13,7 @@ import type {
   DoctorReport,
   TaskHistorySummary,
   TaskHistoryRow,
+  LocalArtifact,
 } from './types';
 
 const BASE = import.meta.env.VITE_API_BASE ?? '';
@@ -203,6 +204,46 @@ export async function clearTaskHistory(keepRecent = 0): Promise<number> {
 
 export async function retrySubtitleJob(mediaId: string): Promise<void> {
   await api<void>(`/api/retry/${encodeURIComponent(mediaId)}`, { method: 'POST' });
+}
+
+// ---- v4：本地 FLAC artifact 管理 + 取消任务 ----
+
+/**
+ * 列出本地 audio_storage_dir 下所有合法的 FLAC artifact（"已 audio_ready，等待
+ * subtitle worker 拉取"的 FLAC）。返回按 created_at_ms 倒序。
+ */
+export async function listLocalArtifacts(): Promise<LocalArtifact[]> {
+  return api<LocalArtifact[]>('/api/artifacts');
+}
+
+/**
+ * 删除本地暂存的 FLAC + 索引。
+ * notify=true（默认）时同步调服务端 audio-lost 让任务回 queued。
+ * 返回是否实际删除了本地文件（false = 索引或文件不存在，不算错误）。
+ */
+export async function deleteLocalArtifact(
+  jobId: string,
+  notify = true,
+): Promise<boolean> {
+  const result = await api<{ deleted: boolean }>(
+    `/api/artifacts/${encodeURIComponent(jobId)}?notify=${notify}`,
+    { method: 'DELETE' },
+  );
+  return result.deleted;
+}
+
+/**
+ * 取消正在跑的任务。
+ * 内部 abort spawned pipeline + 调服务端 fail(worker_capacity) 让任务按 neutral
+ * 路径回 queued（attempt 不增）。
+ * 返回是否成功 abort（false = 任务已经结束）。
+ */
+export async function cancelRunningTask(jobId: string): Promise<boolean> {
+  const result = await api<{ aborted: boolean }>(
+    `/api/tasks/${encodeURIComponent(jobId)}/cancel`,
+    { method: 'POST' },
+  );
+  return result.aborted;
 }
 
 // ---- WebSocket 日志流 ----
