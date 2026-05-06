@@ -1,6 +1,6 @@
 services:
   audio-worker:
-    build: .
+    image: ghcr.io/hor1zon777/m3u8preview-audio-worker-web:latest
     ports:
       - "3900:3900"
     volumes:
@@ -9,5 +9,4 @@ services:
       - ./data/temp:/data/temp                   # 临时文件
     environment:
       - RUST_LOG=info
-      - STATIC_DIR=/srv/audio-worker/static
     restart: unless-stopped
