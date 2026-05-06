@@ -1,0 +1,32 @@
+{
+  "server": {
+    "base_url": "https://m3u8.example.com",
+    "token": "mwt_your_token_here",
+    "poll_interval_sec": 5,
+    "heartbeat_interval_sec": 30,
+    "error_backoff_sec": 5,
+    "verify_tls": true,
+    "max_concurrent_tasks": 1
+  },
+  "pipeline": {
+    "m3u8dl_path": "",
+    "ffmpeg_path": "",
+    "temp_dir": "/data/temp",
+    "audio_storage_dir": "/data/audio-artifacts",
+    "intermediate_audio_format": "flac",
+    "flac_compression_level": 8,
+    "flac_timeout_sec": 600,
+    "audio_local_max_pending": 5
+  },
+  "network": {
+    "github_proxy_enabled": false,
+    "github_proxy_url": "",
+    "download_proxy": ""
+  },
+  "ui": {
+    "minimize_to_tray": false,
+    "autostart": false
+  },
+  "worker_id": "",
+  "worker_name": "audio-worker-docker"
+}

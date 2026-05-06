@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    @apply bg-emby-bg-base text-emby-text-primary font-sans antialiased;
+    user-select: none;
+  }
+  /* 滚动条统一深色风 */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-emby-border rounded;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-emby-text-muted;
+  }
+  /* input 内允许选择 */
+  input,
+  textarea,
+  pre,
+  code {
+    user-select: text;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply px-3 py-1.5 text-sm rounded-md bg-emby-green text-white hover:bg-emby-green-dark transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5;
+  }
+  .btn-secondary {
+    @apply px-3 py-1.5 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5;
+  }
+  /* 图标按钮：方形小尺寸，专配 lucide w-4 h-4 图标，与 btn-secondary 同色系 */
+  .btn-icon {
+    @apply w-9 h-9 inline-flex items-center justify-center rounded-md bg-emby-bg-card border border-emby-border text-emby-text-secondary hover:bg-emby-bg-elevated hover:text-emby-text-primary transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0;
+  }
+  /* 通用文本输入：与 input-base 等价，命名更短便于在 JSX 里使用 */
+  .input,
+  .input-base {
+    @apply w-full px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green text-sm;
+  }
+  .card {
+    @apply bg-emby-bg-card border border-emby-border rounded-lg;
+  }
+}

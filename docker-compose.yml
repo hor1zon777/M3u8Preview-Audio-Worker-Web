@@ -1,0 +1,13 @@
+services:
+  audio-worker:
+    build: .
+    ports:
+      - "3900:3900"
+    volumes:
+      - ./data/config:/etc/audio-worker          # 配置持久化
+      - ./data/audio:/data/audio-artifacts       # FLAC 存储
+      - ./data/temp:/data/temp                   # 临时文件
+    environment:
+      - RUST_LOG=info
+      - STATIC_DIR=/srv/audio-worker/static
+    restart: unless-stopped
