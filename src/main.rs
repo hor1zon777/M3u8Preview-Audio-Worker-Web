@@ -108,11 +108,16 @@ fn build_client_and_worker_id(state: &Arc<AppState>) -> Option<(Arc<ApiClient>, 
 }
 
 fn init_tracing() {
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,audio_worker_web=debug"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .with_ansi(true)
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            fmt::layer()
+                .with_target(false)
+                .with_ansi(true),
+        )
+        .with(log_bus::LogBusLayer)
         .init();
 }
