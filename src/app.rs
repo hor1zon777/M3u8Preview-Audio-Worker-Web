@@ -71,8 +71,8 @@ pub fn build(config_path: PathBuf, port: u16) -> (Router, SharedState) {
 
     let app = Router::new()
         .merge(public_routes)
-        .merge(protected_routes)
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        // auth 中间件只应用于受保护路由，不影响 /api/auth/check
+        .merge(protected_routes.layer(middleware::from_fn_with_state(state.clone(), auth_middleware)))
         // 静态前端（不受鉴权中间件保护）
         .fallback_service(ServeDir::new(static_dir).fallback(fallback))
         .layer(cors)

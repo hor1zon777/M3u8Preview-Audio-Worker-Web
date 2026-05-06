@@ -17,6 +17,7 @@ import {
   registerWorker,
   validateTempDir,
   getRuntimeStatus,
+  setToken,
 } from '../lib/api';
 import type { Settings as SettingsType, ValidateDirResult } from '../lib/types';
 import { ToolsDoctor } from '../components/settings/ToolsDoctor';
@@ -57,7 +58,9 @@ export function Settings() {
 
   const saveMutation = useMutation({
     mutationFn: (s: SettingsType) => saveSettings(s),
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
+      // 同步鉴权 token 到 localStorage，确保后续请求携带正确的 Authorization 头
+      setToken(variables.web_auth_token ?? '');
       queryClient.invalidateQueries({ queryKey: ['settings'] });
       queryClient.invalidateQueries({ queryKey: ['runtime-status'] });
     },
