@@ -52,7 +52,9 @@ pub async fn download(
         .arg("--save-name").arg(save_name)
         .arg("--auto-select")
         .arg("--thread-count").arg("16")
-        .arg("--check-segments-count").arg("false")
+        // 不再禁用分片数量校验：单个 ts 分片下载失败时让 N_m3u8DL-RE 直接 fail，
+        // 而不是静默继续 mux 出一个缺片的 mp4（缺片会导致下游 ffmpeg 报
+        // "moov atom not found"，错误归因混乱）。
         .arg("--no-log")
         .arg("--del-after-done")
         .arg("--no-date-info")
@@ -101,7 +103,56 @@ pub async fn download(
             size
         ));
     }
+
+    // 容器完整性预检：用 ffmpeg 跑一个 100ms 的 null muxer，验证 moov atom 存在 +
+    // 至少一条音频轨道可解码。命中失败则把错误归因到 download 阶段（而不是
+    // 让下游 extract 拿一个缺 moov 的 mp4，最终冒出 "moov atom not found"）。
+    if let Err(e) = probe_container(tools, &downloaded).await {
+        return Err(anyhow!(
+            "downloaded file failed container probe ({}); m3u8DL-RE produced corrupt output \
+             — usually caused by missing/failed segments on source side: {e:#}",
+            downloaded.display()
+        ));
+    }
+
     Ok(downloaded)
+}
+
+/// 用 ffmpeg 探测下载产物的容器完整性。
+///
+/// 命令等价于：`ffmpeg -v error -i <file> -t 0.1 -f null -`
+///   - `-v error`：仅输出错误，moov 缺失会留下明显信号
+///   - `-t 0.1`：只解 100ms，绝大多数文件 < 1s 就退
+///   - `-f null -`：丢弃输出，纯检测
+///
+/// 失败定义：exit != 0 或 stderr 命中 "moov atom not found" / "Invalid data found"。
+/// 给 30s 上限即可（远超大多数 mp4 的索引解析时间）。
+async fn probe_container(tools: &Tools, file: &Path) -> Result<()> {
+    let mut cmd = Command::new(&tools.ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-v").arg("error")
+        .arg("-i").arg(file)
+        .arg("-t").arg("0.1")
+        .arg("-f").arg("null")
+        .arg("-");
+
+    let output = run_streamed("downloader-probe", cmd, Duration::from_secs(30)).await?;
+
+    let stderr_lc = output.stderr.to_ascii_lowercase();
+    let bad_signals = [
+        "moov atom not found",
+        "invalid data found when processing input",
+    ];
+    let hit = bad_signals.iter().any(|sig| stderr_lc.contains(sig));
+
+    if !output.status.success() || hit {
+        return Err(anyhow!(
+            "ffmpeg probe exit {}: {}",
+            output.status,
+            tail(&output.stderr, 800)
+        ));
+    }
+    Ok(())
 }
 
 fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
