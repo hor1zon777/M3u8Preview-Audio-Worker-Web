@@ -32,6 +32,7 @@ use crate::state::SharedState;
 use super::{
     audio_owner, downloader, extractor,
     intermediate::{encode_flac, probe_duration_ms, sha256_and_size},
+    m3u8_parser,
     tools::Tools,
 };
 
@@ -181,17 +182,36 @@ pub async fn run_pipeline(
 /// 校验链：
 ///   1. 索引文件（.json）存在且可解析
 ///   2. FLAC 文件存在且大小与索引一致
-///   3. SHA256 与索引一致（核心：不完整的文件 hash 必然不匹配）
+///   3. duration_ms ≥ min_duration_ms（拒绝旧版本/历史残留的几秒残品）
+///   4. SHA256 与索引一致（核心：不完整的文件 hash 必然不匹配）
 ///
 /// 用于重试场景：上次 pipeline 跑完产出 FLAC 但 audio_ready 因网络失败，
 /// 服务端 job 回滚到 queued，本地 .flac + .json 残留。再次 claim 后
 /// 直接复用缓存，跳过下载/编码。
-async fn try_reuse_cached_flac(storage_dir: &Path, job_id: &str) -> Option<audio_owner::AudioIndexEntry> {
+async fn try_reuse_cached_flac(
+    storage_dir: &Path,
+    job_id: &str,
+    min_duration_ms: i64,
+) -> Option<audio_owner::AudioIndexEntry> {
     let entries = audio_owner::scan_entries(storage_dir).ok()?;
     let entry = entries.into_iter().find(|e| e.job_id == job_id)?;
 
     // 文件必须存在
     if !entry.flac_path.is_file() {
+        return None;
+    }
+
+    // duration 兜底：旧版本可能把 lenient 残品（几秒）写进过缓存。
+    // 新版本 pipeline 已在写入前做相对校验，这里用绝对阈值兜旧残留。
+    if entry.duration_ms < min_duration_ms {
+        tracing::warn!(
+            "[runner] cached FLAC duration too short for job={}: {}ms < min={}ms; \
+             treating as residue and discarding cache",
+            job_id,
+            entry.duration_ms,
+            min_duration_ms
+        );
+        let _ = audio_owner::remove_entry(storage_dir, job_id);
         return None;
     }
 
@@ -263,7 +283,8 @@ async fn pipeline_inner(
     // 0.1 缓存复用：如果本地已有该 job 的 FLAC（上次 audio_ready 因网络失败残留），
     // 校验文件完整性后直接注册 audio_ready，跳过下载/编码。
     let storage_dir = audio_owner::resolve_storage_dir(state)?;
-    if let Some(cached) = try_reuse_cached_flac(&storage_dir, &job.job_id).await {
+    let min_duration_ms = (settings.pipeline.audio_min_duration_sec.saturating_mul(1000)) as i64;
+    if let Some(cached) = try_reuse_cached_flac(&storage_dir, &job.job_id, min_duration_ms).await {
         tracing::info!(
             "[runner] job {} reusing cached FLAC: size={} sha256={} dur={}ms",
             job.job_id,
@@ -305,6 +326,33 @@ async fn pipeline_inner(
         job.job_id,
         workdir_path.display()
     );
+
+    // 0.2 解析 m3u8 总时长，用于编码后做合理性比对。
+    //
+    // 这是拦截 0.1MB 残品（lenient ffmpeg 从损坏 mp4 中抢救出几秒音频）的核心检查点：
+    // 没有"预期时长"的话，无论 size / sha256 校验都拦不住"形似合法但内容残缺"的 FLAC。
+    //
+    // 失败时降级为 0.0（不做相对校验），由 startup_cleanup_suspicious 用绝对阈值兜底。
+    // m3u8 解析对源站只是只读 GET，无副作用；成本相比下载本身可忽略。
+    let expected_duration_sec = match m3u8_parser::fetch_total_duration_sec(
+        m3u8_url,
+        &job.headers,
+        &settings.network.download_proxy,
+    )
+    .await
+    {
+        Ok(d) => {
+            tracing::info!("[runner] m3u8 expected total duration: {:.1}s", d);
+            d
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[runner] m3u8 duration parse failed ({e:#}); skipping duration sanity check \
+                 (lenient salvage residue will only be caught by startup cleanup)"
+            );
+            0.0
+        }
+    };
 
     // 1. 下载（占 5~50%）
     set_phase(phase, "downloading", 5);
@@ -389,6 +437,40 @@ async fn pipeline_inner(
     );
     let (size_bytes, sha256) = size_sha.map_err(|e| anyhow!("sha256: {e:#}"))?;
     let duration_ms = dur.map_err(|e| anyhow!("duration probe: {e:#}"))?;
+
+    // 合理性校验：实际 duration vs m3u8 预期 duration。
+    //
+    // 偏差超过容差比例 = 编码产物不可信，必拒。典型场景：m3u8 拿到的 expected=600s，
+    // 但 lenient ffmpeg 只从坏 mp4 里抢救出 3s，actual=3000ms < expected*0.9=540000ms。
+    // 既不写索引、也不留 tmp_flac，避免下次 try_reuse_cached_flac 把残品当合法缓存复用。
+    //
+    // expected_duration_sec == 0 表示 m3u8 解析失败（早期已 warn），跳过此校验。
+    if expected_duration_sec > 0.0 {
+        let tolerance = settings.pipeline.audio_duration_tolerance.clamp(0.0, 1.0);
+        let expected_ms = (expected_duration_sec * 1000.0) as i64;
+        let lower_bound = ((expected_ms as f64) * (1.0 - tolerance)) as i64;
+        if duration_ms < lower_bound {
+            let _ = std::fs::remove_file(&tmp_flac);
+            return Err(anyhow!(
+                "encode: audio duration sanity check failed — m3u8 expected ≈{}ms \
+                 (lower bound with {:.0}% tolerance: {}ms), got {}ms ({:.1}% of expected). \
+                 Likely ffmpeg lenient mode salvaged only partial audio from a corrupt download. \
+                 Refusing to cache; job will be retried.",
+                expected_ms,
+                tolerance * 100.0,
+                lower_bound,
+                duration_ms,
+                (duration_ms as f64 / expected_ms.max(1) as f64) * 100.0
+            ));
+        }
+        tracing::debug!(
+            "[runner] duration sanity ok: actual={}ms expected≈{}ms tolerance={:.0}%",
+            duration_ms,
+            expected_ms,
+            tolerance * 100.0
+        );
+    }
+
     tracing::info!(
         "[runner] flac meta: size={} sha256={} duration_ms={}",
         size_bytes,

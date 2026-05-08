@@ -94,6 +94,19 @@ pub struct AudioPipelineSettings {
     pub flac_timeout_sec: u64,
     #[serde(default = "default_audio_local_max_pending")]
     pub audio_local_max_pending: u32,
+    /// 编码后实际 duration 与 m3u8 预期 duration 的容差比例（0~1）。
+    ///
+    /// 比如 0.10 表示允许 10% 偏差；偏差超过容差时拒绝写入缓存，避免 lenient 模式
+    /// 产出的 0.1MB 残品（只解出几秒钟音频）被注册为合法产物。
+    /// 当 m3u8 解析失败导致拿不到预期 duration 时跳过此校验。
+    #[serde(default = "default_audio_duration_tolerance")]
+    pub audio_duration_tolerance: f64,
+    /// 启动清理时的最小合法 duration（秒）。
+    ///
+    /// 启动期没有 m3u8 上下文，无法做相对比对，只能用绝对阈值兜底。
+    /// 默认 60s：3-6 秒残品 / 几十秒短片都会被清；真正业务任务通常 ≥ 几分钟。
+    #[serde(default = "default_audio_min_duration_sec")]
+    pub audio_min_duration_sec: u64,
 }
 
 impl Default for AudioPipelineSettings {
@@ -107,6 +120,8 @@ impl Default for AudioPipelineSettings {
             flac_compression_level: default_flac_compression_level(),
             flac_timeout_sec: default_flac_timeout_sec(),
             audio_local_max_pending: default_audio_local_max_pending(),
+            audio_duration_tolerance: default_audio_duration_tolerance(),
+            audio_min_duration_sec: default_audio_min_duration_sec(),
         }
     }
 }
@@ -138,6 +153,12 @@ fn default_flac_timeout_sec() -> u64 {
 }
 fn default_audio_local_max_pending() -> u32 {
     5
+}
+fn default_audio_duration_tolerance() -> f64 {
+    0.10
+}
+fn default_audio_min_duration_sec() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

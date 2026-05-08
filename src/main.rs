@@ -65,6 +65,31 @@ async fn main() {
     });
 
     // 6. 启动 audio_owner fetch_loop 后台 task
+    //
+    // 启动 fetch_loop 之前先做一次性"可疑残品清理"：
+    //   - 历史上 lenient ffmpeg 抢救出的几秒残品（FLAC 0.1MB / duration 几秒）
+    //     可能写入了 storage_dir，启动后会被 fetch_loop 上传给 subtitle worker，造成
+    //     字幕完全错乱。这里在 fetch_loop 起来之前把这种 entry 一次性删干净。
+    //   - 阈值由 settings.pipeline.audio_min_duration_sec 控制（默认 60s）。
+    {
+        let s = state.settings.read().expect("settings lock poisoned").clone();
+        let min_dur = s.pipeline.audio_min_duration_sec;
+        match audio_owner::resolve_storage_dir(&state) {
+            Ok(dir) => {
+                let n = audio_owner::startup_cleanup_suspicious(&dir, min_dur);
+                if n == 0 {
+                    tracing::debug!(
+                        "[main] startup cleanup: no suspicious entries in {}",
+                        dir.display()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[main] startup cleanup skipped: resolve storage dir failed: {e:#}");
+            }
+        }
+    }
+
     let state_for_resolver = state.clone();
     let state_for_loop = state.clone();
     let cancel_fetch = Arc::new(tokio::sync::Notify::new());

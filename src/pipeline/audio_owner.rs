@@ -184,6 +184,56 @@ pub fn scan_entries(dir: &Path) -> Result<Vec<AudioIndexEntry>> {
     Ok(out)
 }
 
+/// startup_cleanup_suspicious：启动时扫描 storage_dir，删除"看起来像残品"的 entry。
+///
+/// 启动期没有 m3u8 上下文，无法做相对时长比对，只能用绝对最小时长阈值兜底。
+///
+/// 删除条件（满足其一）：
+///   1. duration_ms < min_duration_ms（典型场景：lenient ffmpeg 抢救出几秒残品）
+///   2. .json 索引存在但 .flac 缺失 / size 不匹配（已经在 scan_entries 里过滤）
+///
+/// 返回被清理的 entry 数。
+///
+/// 必须在 fetch_loop 启动**之前**调用，避免 broker 派 fetch 时把残品上传给 subtitle worker。
+pub fn startup_cleanup_suspicious(storage_dir: &Path, min_duration_sec: u64) -> usize {
+    let entries = match scan_entries(storage_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                "[audio-owner] startup cleanup: scan {} failed: {:#}",
+                storage_dir.display(),
+                e
+            );
+            return 0;
+        }
+    };
+    let min_ms = (min_duration_sec.saturating_mul(1000)) as i64;
+    let mut removed = 0usize;
+    for entry in entries {
+        if entry.duration_ms < min_ms {
+            tracing::warn!(
+                "[audio-owner] startup cleanup: removing suspicious entry job={} duration_ms={} \
+                 size={} (< min_duration_ms={}). Likely produced by ffmpeg lenient fallback or \
+                 truncated input — refusing to register with server.",
+                entry.job_id,
+                entry.duration_ms,
+                entry.size,
+                min_ms
+            );
+            let _ = remove_entry(storage_dir, &entry.job_id);
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            "[audio-owner] startup cleanup: removed {} suspicious entries from {}",
+            removed,
+            storage_dir.display()
+        );
+    }
+    removed
+}
+
 /// startup_resync：启动时把本地遗留的 FLAC 重新向服务端注册（audio-ready）。
 ///
 /// 服务端可能返回：

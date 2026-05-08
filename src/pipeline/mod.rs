@@ -10,6 +10,7 @@ pub mod audio_owner;
 pub mod downloader;
 pub mod extractor;
 pub mod intermediate;
+pub mod m3u8_parser;
 pub mod poller;
 pub mod proc_util;
 pub mod runner;
