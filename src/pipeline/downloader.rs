@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use tokio::process::Command;
 
 use super::proc_util::{run_streamed, tail};
@@ -179,50 +179,37 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
     let prefix_with_dot = format!("{save_name}.");
     let media_exts: &[&str] = &["mp4", "ts", "m4a", "mkv", "mka", "aac", "wav", "mp3", "ogg", "flac", "webm"];
 
-    // Step 1: 扫描 work_dir 顶层
-    let mut candidates = scan_dir_for_stem(work_dir, save_name, &prefix_with_dot)?;
+    let prefix_clone = prefix_with_dot.clone();
+    let save_name_owned = save_name.to_string();
+    let stem_matcher = move |p: &Path| -> bool {
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        stem == save_name_owned || stem.starts_with(&prefix_clone)
+    };
+    let media_matcher = |p: &Path| -> bool {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        media_exts.iter().any(|x| *x == ext)
+    };
 
-    // Step 2: 扫描 tmp / .tmp 子目录
-    if candidates.is_empty() {
-        for tmp_name in &["tmp", ".tmp"] {
-            let tmp_dir = work_dir.join(tmp_name);
-            if !tmp_dir.is_dir() {
-                continue;
-            }
-            let tmp_hits = scan_dir_for_stem(&tmp_dir, save_name, &prefix_with_dot)?;
-            for hit in tmp_hits {
-                // move 到 work_dir 防止 TempDir drop 时提前清理
-                let dest = work_dir.join(hit.file_name().unwrap_or_default());
-                match std::fs::rename(&hit, &dest) {
-                    Ok(()) => {
-                        tracing::info!("[downloader] moved output from {} to work_dir", hit.display());
-                        candidates.push(dest);
-                    }
-                    Err(_) => {
-                        if let Ok(()) = std::fs::copy(&hit, &dest).and_then(|_| std::fs::remove_file(&hit)) {
-                            tracing::info!("[downloader] moved output from {} (copy+delete fallback)", hit.display());
-                            candidates.push(dest);
-                        } else {
-                            tracing::warn!("[downloader] found output {} but move failed", hit.display());
-                            candidates.push(hit);
-                        }
-                    }
-                }
-            }
-            if !candidates.is_empty() {
-                break;
+    // Step 1: 扫描 work_dir 顶层
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(work_dir) {
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.is_file() && stem_matcher(&path) {
+                candidates.push(path);
             }
         }
     }
 
-    // Step 3: 递归搜索（深度 ≤ 3，跳过 tmp 目录）
+    // Step 2: 递归搜索整个 work_dir（含 tmp），深度限制 6。
+    // N_m3u8DL-RE 偶发将产物放在 tmp/source/0____/ 等深层目录内。
     if candidates.is_empty() {
-        candidates = recursive_scan_stem(work_dir, save_name, &prefix_with_dot, 3)?;
+        candidates = recursive_scan(work_dir, &stem_matcher, 6)?;
     }
 
-    // Step 4: 最终兜底 — 递归搜索任意媒体文件（排除 tmp 目录）
+    // Step 3: 最终兜底 — 递归搜索任意媒体文件
     if candidates.is_empty() {
-        candidates = recursive_scan_media(work_dir, media_exts, 3)?;
+        candidates = recursive_scan(work_dir, &media_matcher, 6)?;
         if !candidates.is_empty() {
             tracing::warn!(
                 "[downloader] stem '{}' not found, falling back to any media file: {:?}",
@@ -272,94 +259,36 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
     Ok(picked)
 }
 
-/// 扫描单个目录，返回匹配 stem 规则的文件列表。
-fn scan_dir_for_stem(dir: &Path, save_name: &str, prefix_with_dot: &str) -> Result<Vec<PathBuf>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut out = Vec::new();
-    for ent in entries.flatten() {
-        let path = ent.path();
-        if !path.is_file() {
-            continue;
-        }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem == save_name || stem.starts_with(prefix_with_dot) {
-            out.push(path);
-        }
-    }
-    Ok(out)
-}
-
-/// 递归搜索匹配 stem 的文件（跳过 tmp / .tmp 目录，深度限制）。
-fn recursive_scan_stem(
+/// 递归搜索文件，matcher 返回 true 表示命中。深度限制防止 symlink 环。
+fn recursive_scan(
     dir: &Path,
-    save_name: &str,
-    prefix_with_dot: &str,
+    matcher: &dyn Fn(&Path) -> bool,
     max_depth: u32,
 ) -> Result<Vec<PathBuf>> {
-    if max_depth == 0 {
-        return Ok(Vec::new());
+    fn walk(
+        dir: &Path,
+        matcher: &dyn Fn(&Path) -> bool,
+        depth: u32,
+        out: &mut Vec<PathBuf>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                walk(&path, matcher, depth - 1, out);
+            } else if path.is_file() && matcher(&path) {
+                out.push(path);
+            }
+        }
     }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
     let mut out = Vec::new();
-    for ent in entries.flatten() {
-        let path = ent.path();
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if path.is_dir() {
-            if name == "tmp" || name == ".tmp" {
-                continue; // 跳过分片缓存目录
-            }
-            if let Ok(sub) = recursive_scan_stem(&path, save_name, prefix_with_dot, max_depth - 1) {
-                out.extend(sub);
-            }
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem == save_name || stem.starts_with(prefix_with_dot) {
-            out.push(path);
-        }
-    }
-    Ok(out)
-}
-
-/// 递归搜索任意媒体文件（按扩展名匹配，跳过 tmp / .tmp 目录）。
-fn recursive_scan_media(dir: &Path, exts: &[&str], max_depth: u32) -> Result<Vec<PathBuf>> {
-    if max_depth == 0 {
-        return Ok(Vec::new());
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut out = Vec::new();
-    for ent in entries.flatten() {
-        let path = ent.path();
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if path.is_dir() {
-            if name == "tmp" || name == ".tmp" {
-                continue;
-            }
-            if let Ok(sub) = recursive_scan_media(&path, exts, max_depth - 1) {
-                out.extend(sub);
-            }
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        if exts.iter().any(|x| *x == ext) {
-            out.push(path);
-        }
-    }
+    walk(dir, matcher, max_depth, &mut out);
     Ok(out)
 }
 
