@@ -103,7 +103,24 @@ pub async fn download(
         ));
     }
 
-    let downloaded = find_downloaded(work_dir, save_name)?;
+    let downloaded = match find_downloaded(work_dir, save_name) {
+        Ok(p) => p,
+        Err(m3u8dl_err) => {
+            // N_m3u8DL-RE exit=0 但无产物（mux 静默失败）→ ffmpeg 直接下载兜底
+            tracing::warn!(
+                "[downloader] N_m3u8DL-RE produced no output, falling back to ffmpeg: {m3u8dl_err:#}"
+            );
+            match ffmpeg_fallback(tools, m3u8_url, work_dir, headers, save_name).await {
+                Ok(p) => p,
+                Err(ffmpeg_err) => {
+                    return Err(anyhow!(
+                        "N_m3u8DL-RE produced no output ({m3u8dl_err}); \
+                         ffmpeg fallback also failed: {ffmpeg_err}"
+                    ));
+                }
+            }
+        }
+    };
     let size = std::fs::metadata(&downloaded).map(|m| m.len()).unwrap_or(0);
     tracing::info!("[downloader] done: {} ({} bytes)", downloaded.display(), size);
     if size < 1024 {
@@ -125,6 +142,70 @@ pub async fn download(
     }
 
     Ok(downloaded)
+}
+
+/// N_m3u8DL-RE 无产物时的 ffmpeg 兜底下载。
+///
+/// ffmpeg 内置 HLS 支持，可直接从 m3u8 URL 下载 + mux 成 mp4。
+/// 命令等价于：`ffmpeg -y -headers "..." -i <url> -c copy output.mp4`
+///
+/// 局限性：
+///   - 不如 N_m3u8DL-RE 智能（不自动选最高码率、不并发分片）
+///   - 某些 CDN / 防盗链场景可能 403（但 headers 已注入）
+///   - 某些极端 m3u8 结构（多音轨、DRM）可能失败
+async fn ffmpeg_fallback(
+    tools: &Tools,
+    m3u8_url: &str,
+    work_dir: &Path,
+    headers: &HashMap<String, String>,
+    save_name: &str,
+) -> Result<PathBuf> {
+    let out_path = work_dir.join(format!("{save_name}.mp4"));
+
+    // 构造 ffmpeg -headers（格式：`Key: Value\r\n`，多个 header 拼接）
+    let mut header_str = String::new();
+    for (k, v) in headers {
+        if v.is_empty() || k.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        header_str.push_str(&format!("{k}: {v}\r\n"));
+    }
+
+    let mut cmd = Command::new(&tools.ffmpeg);
+    cmd.arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel").arg("warning");
+    if !header_str.is_empty() {
+        cmd.arg("-headers").arg(&header_str);
+    }
+    cmd.arg("-i").arg(m3u8_url)
+        .arg("-c").arg("copy")
+        .arg("-movflags").arg("+faststart")
+        .arg(&out_path);
+
+    tracing::info!("[downloader] ffmpeg fallback: downloading {}", truncate_url(m3u8_url, 200));
+    let output = run_streamed("downloader-ffmpeg", cmd, DEFAULT_TIMEOUT).await?;
+
+    if !output.status.success() {
+        let combined = if output.stderr.trim().is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(anyhow!(
+            "ffmpeg exit {}: {}",
+            output.status,
+            tail(combined, 1500)
+        ));
+    }
+
+    if !out_path.is_file() {
+        return Err(anyhow!("ffmpeg produced no output file at {}", out_path.display()));
+    }
+
+    let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!("[downloader] ffmpeg fallback done: {} ({} bytes)", out_path.display(), size);
+    Ok(out_path)
 }
 
 /// 用 ffmpeg 探测下载产物的容器完整性。
