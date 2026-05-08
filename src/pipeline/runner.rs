@@ -181,13 +181,23 @@ pub async fn run_pipeline(
 /// 返回 Some(AudioIndexEntry) 当且仅当：
 ///   - 索引文件（.json）存在且可解析
 ///   - FLAC 文件存在且大小与索引一致
+///   - 文件大小 ≥ 100 KB（太小说明是不完整的片段，不应复用）
 ///
 /// 用于重试场景：上次 pipeline 跑完产出 FLAC 但 audio_ready 因网络失败，
 /// 服务端 job 回滚到 queued，本地 .flac + .json 残留。再次 claim 后
 /// 直接复用缓存，跳过下载/编码。
 fn try_reuse_cached_flac(storage_dir: &Path, job_id: &str) -> Option<audio_owner::AudioIndexEntry> {
+    const MIN_VALID_FLAC_SIZE: i64 = 100 * 1024; // 100 KB
     let entries = audio_owner::scan_entries(storage_dir).ok()?;
     let entry = entries.into_iter().find(|e| e.job_id == job_id)?;
+    // 大小过小 → 不完整片段，不复用
+    if entry.size < MIN_VALID_FLAC_SIZE {
+        tracing::info!(
+            "[runner] cached FLAC too small for job={}: {} bytes (min {}), skipping reuse",
+            job_id, entry.size, MIN_VALID_FLAC_SIZE
+        );
+        return None;
+    }
     // 额外校验文件大小（防索引与文件不一致）
     let disk_size = std::fs::metadata(&entry.flac_path).ok()?.len() as i64;
     if disk_size != entry.size {
