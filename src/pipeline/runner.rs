@@ -176,6 +176,30 @@ pub async fn run_pipeline(
     result
 }
 
+/// 检查本地是否有可复用的缓存 FLAC。
+///
+/// 返回 Some(AudioIndexEntry) 当且仅当：
+///   - 索引文件（.json）存在且可解析
+///   - FLAC 文件存在且大小与索引一致
+///
+/// 用于重试场景：上次 pipeline 跑完产出 FLAC 但 audio_ready 因网络失败，
+/// 服务端 job 回滚到 queued，本地 .flac + .json 残留。再次 claim 后
+/// 直接复用缓存，跳过下载/编码。
+fn try_reuse_cached_flac(storage_dir: &Path, job_id: &str) -> Option<audio_owner::AudioIndexEntry> {
+    let entries = audio_owner::scan_entries(storage_dir).ok()?;
+    let entry = entries.into_iter().find(|e| e.job_id == job_id)?;
+    // 额外校验文件大小（防索引与文件不一致）
+    let disk_size = std::fs::metadata(&entry.flac_path).ok()?.len() as i64;
+    if disk_size != entry.size {
+        tracing::warn!(
+            "[runner] cached FLAC size mismatch for job={}: index={} disk={}",
+            job_id, entry.size, disk_size
+        );
+        return None;
+    }
+    Some(entry)
+}
+
 fn truncate_url(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -215,6 +239,44 @@ async fn pipeline_inner(
         tools.ffmpeg.display()
     );
     push_stage(ctx, &job.job_id, "prepare", stage_start);
+
+    // 0.1 缓存复用：如果本地已有该 job 的 FLAC（上次 audio_ready 因网络失败残留），
+    // 校验文件完整性后直接注册 audio_ready，跳过下载/编码。
+    let storage_dir = audio_owner::resolve_storage_dir(state)?;
+    if let Some(cached) = try_reuse_cached_flac(&storage_dir, &job.job_id) {
+        tracing::info!(
+            "[runner] job {} reusing cached FLAC: size={} sha256={} dur={}ms",
+            job.job_id,
+            cached.size,
+            &cached.sha256[..8.min(cached.sha256.len())],
+            cached.duration_ms
+        );
+        let worker_id = state.worker_id.read().unwrap().clone();
+        let meta = AudioCompleteMeta {
+            worker_id: worker_id.clone(),
+            size: cached.size,
+            sha256: cached.sha256.clone(),
+            format: cached.format.clone(),
+            duration_ms: cached.duration_ms,
+        };
+        if let Err(e) = client.audio_ready(&job.job_id, &meta).await {
+            // audio_ready 失败 → 缓存可能已失效，删掉后走正常流程
+            tracing::warn!(
+                "[runner] cached FLAC audio_ready failed ({}), will re-download",
+                e
+            );
+            let _ = audio_owner::remove_entry(&storage_dir, &job.job_id);
+        } else {
+            // audio_ready 成功 → 取消心跳，记录统计，直接返回
+            cancel.store(true, Ordering::Release);
+            set_phase(phase, "encoding_intermediate", 99);
+            ctx.flac_size = cached.size as u64;
+            ctx.duration_ms = cached.duration_ms;
+            ctx.sha256 = cached.sha256;
+            ctx.format = cached.format;
+            return Ok((ctx.flac_size, ctx.sha256.clone(), ctx.duration_ms));
+        }
+    }
 
     let workdir: TempDir = create_workdir(&settings.pipeline.temp_dir).context("create workdir")?;
     let workdir_path = workdir.path().to_path_buf();
