@@ -155,36 +155,98 @@ async fn probe_container(tools: &Tools, file: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 在 work_dir 下定位 N_m3u8DL-RE 实际写出的产物。
+///
+/// 命名规则的灰色地带（曾遇到过的偶发 case）：
+///   - 单流标准 mux：`source.mp4` / `source.ts` / `source.m4a`（最常见）
+///   - 视频+音频分离的 master m3u8：`source.AVC.mp4` + `source.AAC.m4a`
+///     （EXT-X-MEDIA AUDIO group 存在时，N_m3u8DL-RE 默认按 codec 拆名）
+///   - 多 codec fallback：`source.HEVC.mp4` 等
+///   - mux 阶段被跳过 / 失败但 exit=0：可能只剩分离的中间产物
+///
+/// 之前 `stem == save_name` 严格匹配会在这些场景全部漏掉，触发
+/// "downloaded file not found"。这里改为：
+///   - 匹配 `stem == save_name` 或 `stem` 以 `"<save_name>."` 开头
+///     （第二条覆盖 source.AVC / source.AAC / source.HEVC / source.audio 等）
+///   - 跳过 work_dir/tmp/（那是分片缓存目录，--del-after-done 通常会清，但偶发残留）
+///   - 按优先扩展名排序：含音频的容器优先（m4a / mp4 / ts / mka / mkv / aac / wav）
+///
+/// 失败时把 work_dir 顶层实际文件清单写进错误信息，便于排查到底是
+/// 文件名规则又变了还是真的没下载到。
 fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
     let entries = std::fs::read_dir(work_dir)
         .with_context(|| format!("read work_dir {}", work_dir.display()))?;
 
-    let prefer_ext = ["mp4", "m4a", "ts", "mka", "mkv", "aac", "wav"];
+    // 优先扩展名：m4a / aac 对 audio worker 最直接（已是音频容器）；
+    // mp4 / ts / mkv 紧随其后；wav 兜底。
+    let prefer_ext = ["m4a", "mp4", "ts", "mka", "mkv", "aac", "wav"];
+    let prefix_with_dot = format!("{save_name}.");
 
     let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut top_level: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if !name.is_empty() {
+            top_level.push(name.clone());
+        }
         if !path.is_file() {
+            // 跳过 tmp 分片缓存子目录，其它子目录也不递归（保持简单 + 可控）
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem == save_name {
+        if stem == save_name || stem.starts_with(&prefix_with_dot) {
             candidates.push(path);
         }
     }
     if candidates.is_empty() {
+        top_level.sort();
+        let listing = if top_level.is_empty() {
+            "<empty>".to_string()
+        } else {
+            top_level.join(", ")
+        };
         return Err(anyhow!(
-            "downloaded file not found under {} (expected stem={})",
+            "downloaded file not found under {} (expected stem={} or {}*); \
+             actual entries: [{}]",
             work_dir.display(),
-            save_name
+            save_name,
+            prefix_with_dot,
+            listing
         ));
     }
 
     candidates.sort_by_key(|p| {
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        prefer_ext.iter().position(|x| *x == ext).unwrap_or(usize::MAX)
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let ext_rank = prefer_ext.iter().position(|x| *x == ext).unwrap_or(usize::MAX);
+        // 同扩展名情况下，文件大者优先（mux 完成的整片通常比中间残片大）
+        let neg_size = std::fs::metadata(p)
+            .map(|m| -(m.len() as i64))
+            .unwrap_or(0);
+        (ext_rank, neg_size)
     });
-    Ok(candidates.remove(0))
+    let picked = candidates.remove(0);
+    if !candidates.is_empty() {
+        // 多候选时记一行 info，方便对照实际选了哪个；不上升为 warn 避免噪音。
+        let others: Vec<String> = candidates
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(String::from))
+            .collect();
+        tracing::info!(
+            "[downloader] multiple candidates found, picked {}; others ignored: [{}]",
+            picked.display(),
+            others.join(", ")
+        );
+    }
+    Ok(picked)
 }
 
 fn truncate_url(s: &str, max: usize) -> String {
