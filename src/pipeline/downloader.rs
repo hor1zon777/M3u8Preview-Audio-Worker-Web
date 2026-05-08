@@ -45,6 +45,52 @@ pub async fn download(
     let save_name = "source";
     tracing::info!("[downloader] start: {}", truncate_url(m3u8_url, 200));
 
+    // 第一次尝试：不带 --del-after-done，保留段文件以便失败后重试只补下缺失分段。
+    // --retry-count 3 让 N_m3u8DL-RE 内部先自动重试失败的单个分段。
+    let result = run_m3u8dl(tools, m3u8_url, work_dir, headers, proxy_url, save_name, false).await;
+
+    let downloaded = match result {
+        Ok(path) => path,
+        Err(first_err) => {
+            // 第一次失败：重试一次（段文件仍在 tmp 中，N_m3u8DL-RE 会跳过已下载的，
+            // 只补下失败的分段 → 不会重新下载整个视频）。
+            tracing::warn!(
+                "[downloader] first attempt failed ({first_err:#}), retrying (segments preserved in tmp)"
+            );
+            match run_m3u8dl(tools, m3u8_url, work_dir, headers, proxy_url, save_name, false).await {
+                Ok(path) => path,
+                Err(retry_err) => {
+                    return Err(anyhow!(
+                        "download failed after retry:\n  1st: {first_err}\n  2nd: {retry_err}"
+                    ));
+                }
+            }
+        }
+    };
+
+    // 下载成功后清理 tmp 段文件（延迟到此处才删，确保重试时段文件还在）
+    let tmp_dir = work_dir.join("tmp");
+    if tmp_dir.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
+            tracing::warn!("[downloader] cleanup tmp failed: {e}");
+        }
+    }
+
+    Ok(downloaded)
+}
+
+/// 运行 N_m3u8DL-RE 下载 + 探测产物。
+///
+/// del_after_done: true 时传 --del-after-done（仅首次运行后清理用，重试时不传以保留段文件）。
+async fn run_m3u8dl(
+    tools: &Tools,
+    m3u8_url: &str,
+    work_dir: &Path,
+    headers: &HashMap<String, String>,
+    proxy_url: &str,
+    save_name: &str,
+    del_after_done: bool,
+) -> Result<PathBuf> {
     let mut cmd = Command::new(&tools.m3u8dl);
     cmd.arg(m3u8_url)
         .arg("--save-dir").arg(work_dir)
@@ -52,13 +98,13 @@ pub async fn download(
         .arg("--save-name").arg(save_name)
         .arg("--auto-select")
         .arg("--thread-count").arg("16")
-        // 不再禁用分片数量校验：单个 ts 分片下载失败时让 N_m3u8DL-RE 直接 fail，
-        // 而不是静默继续 mux 出一个缺片的 mp4（缺片会导致下游 ffmpeg 报
-        // "moov atom not found"，错误归因混乱）。
+        .arg("--retry-count").arg("3")
         .arg("--no-log")
-        .arg("--del-after-done")
         .arg("--no-date-info")
         .arg("--ui-language").arg("en-US");
+    if del_after_done {
+        cmd.arg("--del-after-done");
+    }
 
     // 下载代理（HTTP / HTTPS / SOCKS5）
     let trimmed_proxy = proxy_url.trim();
@@ -103,24 +149,7 @@ pub async fn download(
         ));
     }
 
-    let downloaded = match find_downloaded(work_dir, save_name) {
-        Ok(p) => p,
-        Err(m3u8dl_err) => {
-            // N_m3u8DL-RE exit=0 但无产物（mux 静默失败）→ ffmpeg 直接下载兜底
-            tracing::warn!(
-                "[downloader] N_m3u8DL-RE produced no output, falling back to ffmpeg: {m3u8dl_err:#}"
-            );
-            match ffmpeg_fallback(tools, m3u8_url, work_dir, headers, save_name).await {
-                Ok(p) => p,
-                Err(ffmpeg_err) => {
-                    return Err(anyhow!(
-                        "N_m3u8DL-RE produced no output ({m3u8dl_err}); \
-                         ffmpeg fallback also failed: {ffmpeg_err}"
-                    ));
-                }
-            }
-        }
-    };
+    let downloaded = find_downloaded(work_dir, save_name)?;
     let size = std::fs::metadata(&downloaded).map(|m| m.len()).unwrap_or(0);
     tracing::info!("[downloader] done: {} ({} bytes)", downloaded.display(), size);
     if size < 1024 {
@@ -142,70 +171,6 @@ pub async fn download(
     }
 
     Ok(downloaded)
-}
-
-/// N_m3u8DL-RE 无产物时的 ffmpeg 兜底下载。
-///
-/// ffmpeg 内置 HLS 支持，可直接从 m3u8 URL 下载 + mux 成 mp4。
-/// 命令等价于：`ffmpeg -y -headers "..." -i <url> -c copy output.mp4`
-///
-/// 局限性：
-///   - 不如 N_m3u8DL-RE 智能（不自动选最高码率、不并发分片）
-///   - 某些 CDN / 防盗链场景可能 403（但 headers 已注入）
-///   - 某些极端 m3u8 结构（多音轨、DRM）可能失败
-async fn ffmpeg_fallback(
-    tools: &Tools,
-    m3u8_url: &str,
-    work_dir: &Path,
-    headers: &HashMap<String, String>,
-    save_name: &str,
-) -> Result<PathBuf> {
-    let out_path = work_dir.join(format!("{save_name}.mp4"));
-
-    // 构造 ffmpeg -headers（格式：`Key: Value\r\n`，多个 header 拼接）
-    let mut header_str = String::new();
-    for (k, v) in headers {
-        if v.is_empty() || k.eq_ignore_ascii_case("host") {
-            continue;
-        }
-        header_str.push_str(&format!("{k}: {v}\r\n"));
-    }
-
-    let mut cmd = Command::new(&tools.ffmpeg);
-    cmd.arg("-y")
-        .arg("-hide_banner")
-        .arg("-loglevel").arg("warning");
-    if !header_str.is_empty() {
-        cmd.arg("-headers").arg(&header_str);
-    }
-    cmd.arg("-i").arg(m3u8_url)
-        .arg("-c").arg("copy")
-        .arg("-movflags").arg("+faststart")
-        .arg(&out_path);
-
-    tracing::info!("[downloader] ffmpeg fallback: downloading {}", truncate_url(m3u8_url, 200));
-    let output = run_streamed("downloader-ffmpeg", cmd, DEFAULT_TIMEOUT).await?;
-
-    if !output.status.success() {
-        let combined = if output.stderr.trim().is_empty() {
-            &output.stdout
-        } else {
-            &output.stderr
-        };
-        return Err(anyhow!(
-            "ffmpeg exit {}: {}",
-            output.status,
-            tail(combined, 1500)
-        ));
-    }
-
-    if !out_path.is_file() {
-        return Err(anyhow!("ffmpeg produced no output file at {}", out_path.display()));
-    }
-
-    let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
-    tracing::info!("[downloader] ffmpeg fallback done: {} ({} bytes)", out_path.display(), size);
-    Ok(out_path)
 }
 
 /// 用 ffmpeg 探测下载产物的容器完整性。
