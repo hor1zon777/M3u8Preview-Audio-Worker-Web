@@ -18,9 +18,14 @@
 //   --thread-count 16      并发分片下载
 //   --no-log               不写日志文件
 //   --del-after-done       下载后清理 tmp
+//   --binary-merge         用 ffmpeg concat demuxer（list.txt）替代 concat protocol
+//                          (concat:0.ts|1.ts|...)。后者会一次性 open 所有段文件，
+//                          1000+ 段时撞 ulimit -n=1024 报 "Too many open files"，
+//                          merge 静默失败、N_m3u8DL-RE exit=0 但无产物。
+//                          产物为 .ts（自包含），下游 remux 阶段会转 mp4。
 //   -H "Key: Value"        请求头（可重复）
 //
-// 输出：work_dir/source.{mp4,ts,...}（具体扩展名由 N_m3u8DL-RE 决定）
+// 输出：work_dir/source.{mp4,ts,...}（具体扩展名由 N_m3u8DL-RE 决定，binary-merge 时为 .ts）
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -122,7 +127,10 @@ async fn run_m3u8dl(
         .arg("--thread-count").arg("16")
         .arg("--no-log")
         .arg("--no-date-info")
-        .arg("--ui-language").arg("en-US");
+        .arg("--ui-language").arg("en-US")
+        // 强制走 ffmpeg concat demuxer（list 文件）而非 concat protocol，避免长视频
+        // （>1024 段）触发 "Too many open files" 导致 merge 静默失败。详见模块头注释。
+        .arg("--binary-merge");
     if del_after_done {
         cmd.arg("--del-after-done");
     }
