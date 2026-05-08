@@ -124,10 +124,11 @@ pub async fn run(state: SharedState) {
             }
         }
 
-        // 7. claim
+        // 7. claim（网络错误时重试，反向代理偶发丢包不应阻塞整个 worker）
         let worker_id = state.worker_id.read().unwrap().clone();
         let client_arc = Arc::new(client);
-        match client_arc.claim(&worker_id).await {
+        let claim_result = claim_with_retry(&client_arc, &worker_id, 3).await;
+        match claim_result {
             Ok(Some(job)) => {
                 consec_errors = 0;
 
@@ -175,6 +176,37 @@ pub async fn run(state: SharedState) {
             }
         }
     }
+}
+
+/// claim 带网络错误重试。反向代理偶发丢包 / TLS 握手超时不应让 worker 整轮退避。
+///
+/// 仅对网络错误重试；业务错误（401/403/JobLost）和 204 无任务直接返回。
+/// 每次重试间隔 2s，最多 `max_retries` 次。
+async fn claim_with_retry(
+    client: &ApiClient,
+    worker_id: &str,
+    max_retries: u8,
+) -> Result<Option<ClaimedJob>, ApiError> {
+    let mut last_err: Option<ApiError> = None;
+    for attempt in 0..=max_retries {
+        match client.claim(worker_id).await {
+            Ok(result) => return Ok(result),
+            Err(ApiError::Network(e)) => {
+                tracing::warn!(
+                    "[poller] claim network error (attempt {}/{}): {}",
+                    attempt + 1,
+                    max_retries + 1,
+                    e
+                );
+                last_err = Some(ApiError::Network(e));
+                if attempt < max_retries {
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or(ApiError::NotConfigured))
 }
 
 async fn register_self(state: &SharedState, client: &ApiClient) -> Result<(), ApiError> {
