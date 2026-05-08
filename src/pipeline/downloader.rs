@@ -204,6 +204,60 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
         }
     }
     if candidates.is_empty() {
+        // 兜底：N_m3u8DL-RE 偶发将产物写到 tmp 子目录内（如容器内路径解析差异）。
+        // 仅扫描常见的分片子目录 tmp / .tmp，不递归整个 work_dir。
+        for tmp_name in &["tmp", ".tmp"] {
+            let tmp_dir = work_dir.join(tmp_name);
+            if !tmp_dir.is_dir() {
+                continue;
+            }
+            if let Ok(tmp_entries) = std::fs::read_dir(&tmp_dir) {
+                for ent in tmp_entries.flatten() {
+                    let p = ent.path();
+                    if !p.is_file() {
+                        continue;
+                    }
+                    let s = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if s == save_name || s.starts_with(&prefix_with_dot) {
+                        // 在分片子目录找到产物：move 到 work_dir 防止 TempDir 提前清理
+                        let dest = work_dir.join(
+                            p.file_name().unwrap_or_default(),
+                        );
+                        if let Err(e) = std::fs::rename(&p, &dest) {
+                            // 跨设备 rename 失败时 fallback copy+delete
+                            if let Ok(()) = std::fs::copy(&p, &dest).and_then(|_| {
+                                std::fs::remove_file(&p)
+                            }) {
+                                tracing::info!(
+                                    "[downloader] moved output from {} (copy+delete fallback)",
+                                    p.display()
+                                );
+                                candidates.push(dest);
+                                break;
+                            }
+                            tracing::warn!(
+                                "[downloader] found output {} but move failed: {}",
+                                p.display(),
+                                e
+                            );
+                            continue;
+                        }
+                        tracing::info!(
+                            "[downloader] moved output from {} to work_dir",
+                            p.display()
+                        );
+                        candidates.push(dest);
+                        break;
+                    }
+                }
+            }
+            if !candidates.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if candidates.is_empty() {
         top_level.sort();
         let listing = if top_level.is_empty() {
             "<empty>".to_string()
