@@ -163,91 +163,49 @@ async fn probe_container(tools: &Tools, file: &Path) -> Result<()> {
 ///     （EXT-X-MEDIA AUDIO group 存在时，N_m3u8DL-RE 默认按 codec 拆名）
 ///   - 多 codec fallback：`source.HEVC.mp4` 等
 ///   - mux 阶段被跳过 / 失败但 exit=0：可能只剩分离的中间产物
+///   - 产物落在 tmp 子目录内（容器内路径解析差异等偶发场景）
 ///
-/// 之前 `stem == save_name` 严格匹配会在这些场景全部漏掉，触发
-/// "downloaded file not found"。这里改为：
-///   - 匹配 `stem == save_name` 或 `stem` 以 `"<save_name>."` 开头
-///     （第二条覆盖 source.AVC / source.AAC / source.HEVC / source.audio 等）
-///   - 跳过 work_dir/tmp/（那是分片缓存目录，--del-after-done 通常会清，但偶发残留）
-///   - 按优先扩展名排序：含音频的容器优先（m4a / mp4 / ts / mka / mkv / aac / wav）
+/// 搜索策略（由近及远）：
+///   1. work_dir 顶层：stem == save_name 或 starts_with "save_name."
+///   2. tmp / .tmp 子目录：同上规则
+///   3. 递归搜索（深度 ≤ 3）：跳过 tmp 目录，匹配 stem 规则
+///   4. 最终兜底：递归搜索任意媒体文件（.mp4/.ts/.m4a/.mkv/.aac/.wav）
 ///
-/// 失败时把 work_dir 顶层实际文件清单写进错误信息，便于排查到底是
-/// 文件名规则又变了还是真的没下载到。
+/// 按优先扩展名排序：含音频的容器优先（m4a / mp4 / ts / mka / mkv / aac / wav）。
+///
+/// 失败时 dump 完整目录树（深度 3），便于排查。
 fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
-    let entries = std::fs::read_dir(work_dir)
-        .with_context(|| format!("read work_dir {}", work_dir.display()))?;
-
-    // 优先扩展名：m4a / aac 对 audio worker 最直接（已是音频容器）；
-    // mp4 / ts / mkv 紧随其后；wav 兜底。
     let prefer_ext = ["m4a", "mp4", "ts", "mka", "mkv", "aac", "wav"];
     let prefix_with_dot = format!("{save_name}.");
+    let media_exts: &[&str] = &["mp4", "ts", "m4a", "mkv", "mka", "aac", "wav", "mp3", "ogg", "flac", "webm"];
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let mut top_level: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if !name.is_empty() {
-            top_level.push(name.clone());
-        }
-        if !path.is_file() {
-            // 跳过 tmp 分片缓存子目录，其它子目录也不递归（保持简单 + 可控）
-            continue;
-        }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem == save_name || stem.starts_with(&prefix_with_dot) {
-            candidates.push(path);
-        }
-    }
+    // Step 1: 扫描 work_dir 顶层
+    let mut candidates = scan_dir_for_stem(work_dir, save_name, &prefix_with_dot)?;
+
+    // Step 2: 扫描 tmp / .tmp 子目录
     if candidates.is_empty() {
-        // 兜底：N_m3u8DL-RE 偶发将产物写到 tmp 子目录内（如容器内路径解析差异）。
-        // 仅扫描常见的分片子目录 tmp / .tmp，不递归整个 work_dir。
         for tmp_name in &["tmp", ".tmp"] {
             let tmp_dir = work_dir.join(tmp_name);
             if !tmp_dir.is_dir() {
                 continue;
             }
-            if let Ok(tmp_entries) = std::fs::read_dir(&tmp_dir) {
-                for ent in tmp_entries.flatten() {
-                    let p = ent.path();
-                    if !p.is_file() {
-                        continue;
-                    }
-                    let s = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    if s == save_name || s.starts_with(&prefix_with_dot) {
-                        // 在分片子目录找到产物：move 到 work_dir 防止 TempDir 提前清理
-                        let dest = work_dir.join(
-                            p.file_name().unwrap_or_default(),
-                        );
-                        if let Err(e) = std::fs::rename(&p, &dest) {
-                            // 跨设备 rename 失败时 fallback copy+delete
-                            if let Ok(()) = std::fs::copy(&p, &dest).and_then(|_| {
-                                std::fs::remove_file(&p)
-                            }) {
-                                tracing::info!(
-                                    "[downloader] moved output from {} (copy+delete fallback)",
-                                    p.display()
-                                );
-                                candidates.push(dest);
-                                break;
-                            }
-                            tracing::warn!(
-                                "[downloader] found output {} but move failed: {}",
-                                p.display(),
-                                e
-                            );
-                            continue;
-                        }
-                        tracing::info!(
-                            "[downloader] moved output from {} to work_dir",
-                            p.display()
-                        );
+            let tmp_hits = scan_dir_for_stem(&tmp_dir, save_name, &prefix_with_dot)?;
+            for hit in tmp_hits {
+                // move 到 work_dir 防止 TempDir drop 时提前清理
+                let dest = work_dir.join(hit.file_name().unwrap_or_default());
+                match std::fs::rename(&hit, &dest) {
+                    Ok(()) => {
+                        tracing::info!("[downloader] moved output from {} to work_dir", hit.display());
                         candidates.push(dest);
-                        break;
+                    }
+                    Err(_) => {
+                        if let Ok(()) = std::fs::copy(&hit, &dest).and_then(|_| std::fs::remove_file(&hit)) {
+                            tracing::info!("[downloader] moved output from {} (copy+delete fallback)", hit.display());
+                            candidates.push(dest);
+                        } else {
+                            tracing::warn!("[downloader] found output {} but move failed", hit.display());
+                            candidates.push(hit);
+                        }
                     }
                 }
             }
@@ -257,20 +215,33 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
         }
     }
 
+    // Step 3: 递归搜索（深度 ≤ 3，跳过 tmp 目录）
     if candidates.is_empty() {
-        top_level.sort();
-        let listing = if top_level.is_empty() {
-            "<empty>".to_string()
-        } else {
-            top_level.join(", ")
-        };
+        candidates = recursive_scan_stem(work_dir, save_name, &prefix_with_dot, 3)?;
+    }
+
+    // Step 4: 最终兜底 — 递归搜索任意媒体文件（排除 tmp 目录）
+    if candidates.is_empty() {
+        candidates = recursive_scan_media(work_dir, media_exts, 3)?;
+        if !candidates.is_empty() {
+            tracing::warn!(
+                "[downloader] stem '{}' not found, falling back to any media file: {:?}",
+                save_name,
+                candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    if candidates.is_empty() {
+        // dump 完整目录树用于诊断
+        let tree = dump_tree(work_dir, 3);
         return Err(anyhow!(
-            "downloaded file not found under {} (expected stem={} or {}*); \
-             actual entries: [{}]",
+            "downloaded file not found under {} (expected stem={} or {}*);\n\
+             directory tree:\n{}",
             work_dir.display(),
             save_name,
             prefix_with_dot,
-            listing
+            tree
         ));
     }
 
@@ -281,7 +252,6 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
             .unwrap_or("")
             .to_lowercase();
         let ext_rank = prefer_ext.iter().position(|x| *x == ext).unwrap_or(usize::MAX);
-        // 同扩展名情况下，文件大者优先（mux 完成的整片通常比中间残片大）
         let neg_size = std::fs::metadata(p)
             .map(|m| -(m.len() as i64))
             .unwrap_or(0);
@@ -289,7 +259,6 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
     });
     let picked = candidates.remove(0);
     if !candidates.is_empty() {
-        // 多候选时记一行 info，方便对照实际选了哪个；不上升为 warn 避免噪音。
         let others: Vec<String> = candidates
             .iter()
             .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(String::from))
@@ -301,6 +270,131 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
         );
     }
     Ok(picked)
+}
+
+/// 扫描单个目录，返回匹配 stem 规则的文件列表。
+fn scan_dir_for_stem(dir: &Path, save_name: &str, prefix_with_dot: &str) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem == save_name || stem.starts_with(prefix_with_dot) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// 递归搜索匹配 stem 的文件（跳过 tmp / .tmp 目录，深度限制）。
+fn recursive_scan_stem(
+    dir: &Path,
+    save_name: &str,
+    prefix_with_dot: &str,
+    max_depth: u32,
+) -> Result<Vec<PathBuf>> {
+    if max_depth == 0 {
+        return Ok(Vec::new());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if path.is_dir() {
+            if name == "tmp" || name == ".tmp" {
+                continue; // 跳过分片缓存目录
+            }
+            if let Ok(sub) = recursive_scan_stem(&path, save_name, prefix_with_dot, max_depth - 1) {
+                out.extend(sub);
+            }
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem == save_name || stem.starts_with(prefix_with_dot) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// 递归搜索任意媒体文件（按扩展名匹配，跳过 tmp / .tmp 目录）。
+fn recursive_scan_media(dir: &Path, exts: &[&str], max_depth: u32) -> Result<Vec<PathBuf>> {
+    if max_depth == 0 {
+        return Ok(Vec::new());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if path.is_dir() {
+            if name == "tmp" || name == ".tmp" {
+                continue;
+            }
+            if let Ok(sub) = recursive_scan_media(&path, exts, max_depth - 1) {
+                out.extend(sub);
+            }
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if exts.iter().any(|x| *x == ext) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// dump 目录树（用于诊断 "file not found" 场景）。
+fn dump_tree(dir: &Path, max_depth: u32) -> String {
+    fn walk(dir: &Path, depth: u32, max: u32, out: &mut String, prefix: &str) {
+        if depth > max {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut items: Vec<_> = entries.flatten().collect();
+        items.sort_by_key(|e| e.file_name());
+        for (i, ent) in items.iter().enumerate() {
+            let path = ent.path();
+            let name = ent.file_name().to_string_lossy().to_string();
+            let is_last = i == items.len() - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            let child_prefix = if is_last { "    " } else { "│   " };
+            if path.is_dir() {
+                out.push_str(&format!("{}{}{}/\n", prefix, connector, name));
+                walk(&path, depth + 1, max, out, &format!("{}{}", prefix, child_prefix));
+            } else {
+                let size = std::fs::metadata(&path)
+                    .map(|m| format!(" ({} bytes)", m.len()))
+                    .unwrap_or_default();
+                out.push_str(&format!("{}{}{}{}\n", prefix, connector, name, size));
+            }
+        }
+    }
+    let mut out = format!("{}/\n", dir.display());
+    walk(dir, 1, max_depth, &mut out, "");
+    out
 }
 
 fn truncate_url(s: &str, max: usize) -> String {
