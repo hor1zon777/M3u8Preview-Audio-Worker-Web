@@ -98,7 +98,6 @@ async fn run_m3u8dl(
         .arg("--save-name").arg(save_name)
         .arg("--auto-select")
         .arg("--thread-count").arg("16")
-        .arg("--retry-count").arg("3")
         .arg("--no-log")
         .arg("--no-date-info")
         .arg("--ui-language").arg("en-US");
