@@ -81,6 +81,15 @@ pub async fn download(
 
     let output = run_streamed("downloader", cmd, DEFAULT_TIMEOUT).await?;
 
+    // 无论成功失败都记录 N_m3u8DL-RE 输出（mux 静默失败时 exit=0 但无产物，
+    // 需要看 stdout 确认 mux 是否被跳过 / 失败）。
+    if !output.stdout.trim().is_empty() {
+        tracing::debug!("[downloader] stdout:\n{}", tail(&output.stdout, 2000));
+    }
+    if !output.stderr.trim().is_empty() {
+        tracing::debug!("[downloader] stderr:\n{}", tail(&output.stderr, 2000));
+    }
+
     if !output.status.success() {
         let combined = if output.stderr.trim().is_empty() {
             output.stdout
@@ -221,9 +230,11 @@ fn find_downloaded(work_dir: &Path, save_name: &str) -> Result<PathBuf> {
 
     if candidates.is_empty() {
         // dump 完整目录树用于诊断
-        let tree = dump_tree(work_dir, 3);
+        let tree = dump_tree(work_dir, 4);
         return Err(anyhow!(
-            "downloaded file not found under {} (expected stem={} or {}*);\n\
+            "downloaded file not found under {} (expected stem={} or {}*); \
+             N_m3u8DL-RE exited successfully but produced no output file \
+             (mux step likely failed silently — check [downloader] debug logs above).\n\
              directory tree:\n{}",
             work_dir.display(),
             save_name,
