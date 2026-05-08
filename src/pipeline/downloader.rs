@@ -67,26 +67,31 @@ pub async fn download(
         }
     };
 
-    // 下载成功后清理 tmp 段文件（延迟到此处才删，确保重试时段文件还在）
+    // 下载成功后 remux 成自包含文件，再清理 tmp。
+    // N_m3u8DL-RE 不带 --del-after-done 时，产出的容器可能引用 tmp 中的段文件。
+    // 段文件缺失会导致 remux 失败（ffmpeg 同样读不到缺失的段）。
     let tmp_dir = work_dir.join("tmp");
-
-    // N_m3u8DL-RE 未传 --del-after-done 时，产出的容器可能引用 tmp 中的段文件。
-    // 用 ffmpeg remux 成自包含文件（-c copy 不重编码，只重封装），确保后续
-    // extract 阶段不依赖 tmp 目录。
     let downloaded = if tmp_dir.is_dir() {
-        let remuxed = remux_self_contained(tools, &downloaded, work_dir, save_name).await;
-        match remuxed {
-            Ok(p) => {
-                // remux 成功后清理 tmp
+        match remux_self_contained(tools, &downloaded, work_dir, save_name).await {
+            Ok(remuxed) => {
+                // remux 成功：清理 tmp
                 if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
                     tracing::warn!("[downloader] cleanup tmp failed: {e}");
                 }
-                p
+                remuxed
             }
-            Err(e) => {
-                tracing::warn!("[downloader] remux failed ({e:#}), using original file");
-                // remux 失败时保留 tmp（原始文件可能依赖它）
-                downloaded
+            Err(remux_err) => {
+                // remux 失败：N_m3u8DL-RE 产出了损坏的容器（段文件缺失）。
+                // 清理 tmp 后用 --del-after-done 重新下载（完整重下，
+                // N_m3u8DL-RE 会把所有段直接 mux 到输出文件中）。
+                tracing::warn!(
+                    "[downloader] remux failed ({remux_err:#}), \
+                     re-downloading with --del-after-done"
+                );
+                if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
+                    tracing::warn!("[downloader] cleanup tmp before re-download failed: {e}");
+                }
+                run_m3u8dl(tools, m3u8_url, work_dir, headers, proxy_url, save_name, true).await?
             }
         }
     } else {
