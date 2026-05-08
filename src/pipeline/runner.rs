@@ -178,27 +178,24 @@ pub async fn run_pipeline(
 
 /// 检查本地是否有可复用的缓存 FLAC。
 ///
-/// 返回 Some(AudioIndexEntry) 当且仅当：
-///   - 索引文件（.json）存在且可解析
-///   - FLAC 文件存在且大小与索引一致
-///   - 文件大小 ≥ 100 KB（太小说明是不完整的片段，不应复用）
+/// 校验链：
+///   1. 索引文件（.json）存在且可解析
+///   2. FLAC 文件存在且大小与索引一致
+///   3. SHA256 与索引一致（核心：不完整的文件 hash 必然不匹配）
 ///
 /// 用于重试场景：上次 pipeline 跑完产出 FLAC 但 audio_ready 因网络失败，
 /// 服务端 job 回滚到 queued，本地 .flac + .json 残留。再次 claim 后
 /// 直接复用缓存，跳过下载/编码。
-fn try_reuse_cached_flac(storage_dir: &Path, job_id: &str) -> Option<audio_owner::AudioIndexEntry> {
-    const MIN_VALID_FLAC_SIZE: i64 = 100 * 1024; // 100 KB
+async fn try_reuse_cached_flac(storage_dir: &Path, job_id: &str) -> Option<audio_owner::AudioIndexEntry> {
     let entries = audio_owner::scan_entries(storage_dir).ok()?;
     let entry = entries.into_iter().find(|e| e.job_id == job_id)?;
-    // 大小过小 → 不完整片段，不复用
-    if entry.size < MIN_VALID_FLAC_SIZE {
-        tracing::info!(
-            "[runner] cached FLAC too small for job={}: {} bytes (min {}), skipping reuse",
-            job_id, entry.size, MIN_VALID_FLAC_SIZE
-        );
+
+    // 文件必须存在
+    if !entry.flac_path.is_file() {
         return None;
     }
-    // 额外校验文件大小（防索引与文件不一致）
+
+    // 大小必须一致
     let disk_size = std::fs::metadata(&entry.flac_path).ok()?.len() as i64;
     if disk_size != entry.size {
         tracing::warn!(
@@ -207,6 +204,19 @@ fn try_reuse_cached_flac(storage_dir: &Path, job_id: &str) -> Option<audio_owner
         );
         return None;
     }
+
+    // SHA256 校验：不完整 / 损坏的文件 hash 必然不匹配
+    let (_, actual_sha) = sha256_and_size(&entry.flac_path).await.ok()?;
+    if actual_sha != entry.sha256 {
+        tracing::warn!(
+            "[runner] cached FLAC sha256 mismatch for job={}: index={} actual={}",
+            job_id,
+            &entry.sha256[..8.min(entry.sha256.len())],
+            &actual_sha[..8.min(actual_sha.len())]
+        );
+        return None;
+    }
+
     Some(entry)
 }
 
@@ -253,7 +263,7 @@ async fn pipeline_inner(
     // 0.1 缓存复用：如果本地已有该 job 的 FLAC（上次 audio_ready 因网络失败残留），
     // 校验文件完整性后直接注册 audio_ready，跳过下载/编码。
     let storage_dir = audio_owner::resolve_storage_dir(state)?;
-    if let Some(cached) = try_reuse_cached_flac(&storage_dir, &job.job_id) {
+    if let Some(cached) = try_reuse_cached_flac(&storage_dir, &job.job_id).await {
         tracing::info!(
             "[runner] job {} reusing cached FLAC: size={} sha256={} dur={}ms",
             job.job_id,
