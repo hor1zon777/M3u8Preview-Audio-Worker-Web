@@ -46,7 +46,6 @@ pub async fn download(
     tracing::info!("[downloader] start: {}", truncate_url(m3u8_url, 200));
 
     // 第一次尝试：不带 --del-after-done，保留段文件以便失败后重试只补下缺失分段。
-    // --retry-count 3 让 N_m3u8DL-RE 内部先自动重试失败的单个分段。
     let result = run_m3u8dl(tools, m3u8_url, work_dir, headers, proxy_url, save_name, false).await;
 
     let downloaded = match result {
@@ -70,11 +69,29 @@ pub async fn download(
 
     // 下载成功后清理 tmp 段文件（延迟到此处才删，确保重试时段文件还在）
     let tmp_dir = work_dir.join("tmp");
-    if tmp_dir.is_dir() {
-        if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
-            tracing::warn!("[downloader] cleanup tmp failed: {e}");
+
+    // N_m3u8DL-RE 未传 --del-after-done 时，产出的容器可能引用 tmp 中的段文件。
+    // 用 ffmpeg remux 成自包含文件（-c copy 不重编码，只重封装），确保后续
+    // extract 阶段不依赖 tmp 目录。
+    let downloaded = if tmp_dir.is_dir() {
+        let remuxed = remux_self_contained(tools, &downloaded, work_dir, save_name).await;
+        match remuxed {
+            Ok(p) => {
+                // remux 成功后清理 tmp
+                if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
+                    tracing::warn!("[downloader] cleanup tmp failed: {e}");
+                }
+                p
+            }
+            Err(e) => {
+                tracing::warn!("[downloader] remux failed ({e:#}), using original file");
+                // remux 失败时保留 tmp（原始文件可能依赖它）
+                downloaded
+            }
         }
-    }
+    } else {
+        downloaded
+    };
 
     Ok(downloaded)
 }
@@ -170,6 +187,65 @@ async fn run_m3u8dl(
     }
 
     Ok(downloaded)
+}
+
+/// 把 N_m3u8DL-RE 产出的容器 remux 成自包含文件。
+///
+/// N_m3u8DL-RE 不带 --del-after-done 时，产出的 mp4/ts 可能通过相对路径引用
+/// tmp 目录中的段文件。ffmpeg 读取时会报 "No such file or directory"。
+///
+/// 用 `ffmpeg -i input -c copy -movflags +faststart output.mp4` 重封装：
+/// - `-c copy`：不重编码，只重新封装，速度快
+/// - 产出的 mp4 完全自包含，不依赖外部段文件
+/// - 原始文件替换为 remux 后的文件
+async fn remux_self_contained(
+    tools: &Tools,
+    input: &Path,
+    work_dir: &Path,
+    save_name: &str,
+) -> Result<PathBuf> {
+    let out_path = work_dir.join(format!("{save_name}.remux.mp4"));
+
+    let mut cmd = Command::new(&tools.ffmpeg);
+    cmd.arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel").arg("warning")
+        .arg("-i").arg(input)
+        .arg("-c").arg("copy")
+        .arg("-movflags").arg("+faststart")
+        .arg(&out_path);
+
+    tracing::info!("[downloader] remuxing to self-contained mp4");
+    let output = run_streamed("downloader-remux", cmd, Duration::from_secs(120)).await?;
+
+    if !output.status.success() || !out_path.is_file() {
+        let combined = if output.stderr.trim().is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(anyhow!("remux exit {}: {}", output.status, tail(combined, 800)));
+    }
+
+    // 用 remux 后的文件替换原始文件
+    let final_path = work_dir.join(format!(
+        "{}.mp4",
+        save_name
+    ));
+    if let Err(e) = std::fs::rename(&out_path, &final_path) {
+        // 跨设备 fallback
+        std::fs::copy(&out_path, &final_path)?;
+        let _ = std::fs::remove_file(&out_path);
+        tracing::info!("[downloader] remux rename fallback (copy+delete): {e}");
+    }
+    // 删除原始文件（可能引用外部段文件）
+    if input != final_path {
+        let _ = std::fs::remove_file(input);
+    }
+
+    let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!("[downloader] remux done: {} ({} bytes)", final_path.display(), size);
+    Ok(final_path)
 }
 
 /// 用 ffmpeg 探测下载产物的容器完整性。
