@@ -467,6 +467,14 @@ impl ApiClient {
         if resp.status() == StatusCode::NO_CONTENT {
             return Ok(None);
         }
+        // 503 Service Unavailable：服务端 audio-fetch 超时（audio worker 未在 30s 内
+        // 推流 FLAC）。视为无任务，让 fetch_loop 立即重新 poll，而非上抛错误触发退避。
+        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+            tracing::debug!(
+                "[api] audio_fetch_poll got 503 (server timeout), treating as no-task"
+            );
+            return Ok(None);
+        }
         let task: AudioFetchTask = decode_envelope(resp).await?;
         Ok(Some(task))
     }

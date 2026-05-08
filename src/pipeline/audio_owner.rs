@@ -351,10 +351,21 @@ async fn handle_task(
                 Some(entry) => {
                     // v3.2 分块上传（绕开 Cloudflare 等 CDN 100 MiB 上限）；服务端
                     // broker 在同一条 io.Pipe 上拼接，subtitle worker 端无感知
-                    client
+                    if let Err(e) = client
                         .audio_stream_chunked(&task.job_id, worker_id, &entry.flac_path)
                         .await
-                        .map_err(|e| anyhow!("audio_stream_chunked: {e}"))?;
+                    {
+                        // 流式上传失败：保留本地 FLAC 等服务端重试（不调 audio_lost、
+                        // 不删 entry）。服务端 broker 超时后应增加重试次数重新派发
+                        // fetch，若超过 maxRetries 才发 cleanup 指令清理本地。
+                        tracing::warn!(
+                            "[audio-owner] audio_stream_chunked failed: job={} err={:#} \
+                             (keeping local FLAC for server retry)",
+                            task.job_id,
+                            e
+                        );
+                        return Ok(());
+                    }
                     tracing::info!(
                         "[audio-owner] fetch served: job={} size={}",
                         task.job_id,
